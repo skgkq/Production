@@ -53,8 +53,8 @@ const DEFAULT_TYPES = [
 
 // ─── Default weekly plan ─────────────────────────────────────────
 const DEFAULT_PLAN = [
-  {id:"t1", typeId:"pt1", batches:3, priority:1, note:""},
-  {id:"t2", typeId:"pt2", batches:2, priority:2, note:""},
+  {id:"t1", typeId:"pt1", batches:1, priority:1, note:""},
+  {id:"t2", typeId:"pt2", batches:1, priority:2, note:""},
 ];
 
 // ─── Default constraints ─────────────────────────────────────────
