@@ -1,8 +1,10 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
+// import { AgentWidget } from "./components/agent";  // 智能客服：汇报前暂不展示，取消注释即可启用
 
 // ══════════════════════════════════════════════════════════════════
-//  一号线日/周排产系统  v3
+//  一号线日/周排产系统  v4 (支持动态重调度)
 //  一台混合锅 · 多型号 · 班次约束 · 换产/清洗/AGV约束 · 工单输出
+//  v4 新增:插单 / 设备故障 / 滚动重排
 // ══════════════════════════════════════════════════════════════════
 
 const PALETTE = ["#3b82f6","#10b981","#f59e0b","#ef4444","#8b5cf6",
@@ -51,56 +53,67 @@ const DEFAULT_TYPES = [
   },
 ];
 
-// ─── Default weekly plan ─────────────────────────────────────────
 const DEFAULT_PLAN = [
   {id:"t1", typeId:"pt1", batches:1, priority:1, note:""},
   {id:"t2", typeId:"pt2", batches:1, priority:2, note:""},
 ];
 
-// ─── Default constraints ─────────────────────────────────────────
 const DEFAULT_CST = {
-  totalWorkers   : 4,     // 可用人员总数
-  stockMatA      : 200,   // 原料A库存
-  stockMatB      : 80,    // 原料B库存
-  stockRelease   : 10,    // 脱模剂库存
-  shiftStart     : 9,     // 早班开始 09:00
-  shiftEnd       : 18,    // 班次结束 18:00
-  lunchStart     : 12,    // 午休开始
-  lunchEnd       : 13,    // 午休结束
-  workDays       : 5,     // 排产天数
+  totalWorkers   : 4,
+  stockMatA      : 200,
+  stockMatB      : 80,
+  stockRelease   : 10,
+  shiftStart     : 9,
+  shiftEnd       : 18,
+  lunchStart     : 12,
+  lunchEnd       : 13,
+  workDays       : 5,
 };
 
 // ══════════════════════════════════════════════════════════════════
 //  Scheduler Core
 // ══════════════════════════════════════════════════════════════════
 
-// t = 以"本周一 00:00"为原点的绝对小时数
-// 返回 >= t 的最早可工作时刻（跳过非班次时间和午休）
+// 检查时刻 t 是否落在某设备的故障窗口内,返回故障窗结束时刻 (无故障返回 null)
+function inFailureWindow(eq, t, failures) {
+  for (const f of (failures || [])) {
+    if (f.eq === eq && t >= f.start && t < f.end) return f.end;
+  }
+  return null;
+}
+
+// 检查 [start, start+dur) 是否与故障窗口重叠
+function overlapsFailure(eq, start, dur, failures) {
+  const end = start + dur;
+  for (const f of (failures || [])) {
+    if (f.eq !== eq) continue;
+    if (start < f.end && end > f.start) return f.end;
+  }
+  return null;
+}
+
 function nextWorkStart(t, cst) {
   for (let i = 0; i < 500; i++) {
     if (t >= cst.workDays * 24) return Infinity;
     const day = Math.floor(t / 24), h = t % 24;
     if (h < cst.shiftStart) { t = day * 24 + cst.shiftStart; continue; }
     if (h >= cst.shiftEnd)  { t = (day + 1) * 24 + cst.shiftStart; continue; }
-    // 午休时段跳过
     if (h >= cst.lunchStart && h < cst.lunchEnd) { t = day * 24 + cst.lunchEnd; continue; }
     return t;
   }
   return Infinity;
 }
 
-// 检查 [start, start+dur) 是否跨越午休，若跨越返回false
 function fitsWithoutLunch(start, dur, cst) {
   const day = Math.floor(start / 24);
   const ls = day * 24 + cst.lunchStart;
   const le = day * 24 + cst.lunchEnd;
   const end = start + dur;
-  // 如果工序时间段和午休有重叠则不行
   if (start < le && end > ls) return false;
   return true;
 }
 
-function findSlot(tl, minStart, dur, cst, workerTl, workers) {
+function findSlot(eq, tl, minStart, dur, cst, workerTl, workers, failures) {
   let t = nextWorkStart(minStart, cst);
 
   for (let iter = 0; iter < 50000; iter++) {
@@ -108,25 +121,26 @@ function findSlot(tl, minStart, dur, cst, workerTl, workers) {
     t = nextWorkStart(t, cst);
     if (t === Infinity) return Infinity;
 
-    // Must fit within same shift (before shift end)
     const dayBase = Math.floor(t / 24) * 24;
     const shiftEnd = dayBase + cst.shiftEnd;
     if (t + dur > shiftEnd) { t = nextWorkStart(shiftEnd, cst); continue; }
 
-    // Must not cross lunch break
     if (!fitsWithoutLunch(t, dur, cst)) {
       t = dayBase + cst.lunchEnd;
       continue;
     }
 
-    // Check no overlap with existing timeline blocks on this equipment
+    // 设备故障窗口
+    const failEnd = overlapsFailure(eq, t, dur, failures);
+    if (failEnd != null) { t = nextWorkStart(failEnd, cst); continue; }
+
+    // 设备时间线占用
     const clash = (tl || []).find(s => s.start < t + dur && s.end > t);
     if (clash) { t = nextWorkStart(clash.end, cst); continue; }
 
-    // Check worker availability: count concurrent workers in [t, t+dur)
+    // 人员
     const maxConcurrent = peakWorkers(workerTl, t, t + dur);
     if (maxConcurrent + workers > cst.totalWorkers) {
-      // Find next moment when a worker is freed
       const overlapping = workerTl.filter(s => s.start < t + dur && s.end > t);
       const nextFree = Math.min(...overlapping.map(s => s.end));
       t = nextWorkStart(nextFree, cst);
@@ -138,10 +152,8 @@ function findSlot(tl, minStart, dur, cst, workerTl, workers) {
   return Infinity;
 }
 
-// 计算 [start, end) 时间段内的峰值并发人数
 function peakWorkers(workerTl, start, end) {
   let max = 0;
-  // 收集所有在范围内的时间点
   const points = new Set();
   for (const s of workerTl) {
     if (s.end <= start || s.start >= end) continue;
@@ -159,41 +171,72 @@ function peakWorkers(workerTl, start, end) {
   return max;
 }
 
-function runSchedule(plan, types, cst) {
-  const tls  = {};   // eq → [{start,end}]
-  const workerTl = []; // global worker timeline [{start,end,workers}]
-  const addTL = (eq, start, end, workers) => {
-    if (!tls[eq]) tls[eq] = [];
-    tls[eq].push({ start, end });
-    tls[eq].sort((a, b) => a.start - b.start);
-    if (workers > 0) {
-      workerTl.push({ start, end, workers });
-    }
-  };
+/**
+ * 主排产函数(支持动态重调度)
+ * @param {Array}  plan       任务列表 [{id,typeId,batches,priority,note}]
+ * @param {Array}  types      型号配置
+ * @param {Object} cst        约束参数
+ * @param {Object} [opts]     可选项
+ * @param {Array}  [opts.frozenEvents]  冻结工序(已完成/进行中,不重排)
+ * @param {Array}  [opts.failures]      设备故障窗口 [{eq,start,end,reason}]
+ * @param {Number} [opts.minStart]      所有新工序最早开始时刻(默认 0)
+ * @param {Object} [opts.batchProgress] 各批次工序进度 {batchKey: nextOpIdx}
+ * @param {Number} [opts.consumedMatA/B/Release] 已消耗物料(从可用库存中扣除)
+ */
+function runSchedule(plan, types, cst, opts = {}) {
+  const {
+    frozenEvents = [],
+    failures = [],
+    minStart = 0,
+    batchProgress = {},   // { "ptId|wo": startOpIdx }
+  } = opts;
 
-  // Expand plan → sorted batch list
+  const tls  = {};
+  const workerTl = [];
+
+  // 用冻结工序初始化时间线
+  for (const e of frozenEvents) {
+    if (!tls[e.eq]) tls[e.eq] = [];
+    tls[e.eq].push({ start: e.start, end: e.end });
+    if (e.workers > 0) workerTl.push({ start: e.start, end: e.end, workers: e.workers });
+  }
+  for (const eq in tls) tls[eq].sort((a,b)=>a.start-b.start);
+
+  // 展开 plan → batches
   const batches = [];
   let woCnt = 1;
   for (const task of [...plan].sort((a, b) => a.priority - b.priority)) {
     const pt = types.find(t => t.id === task.typeId);
     if (!pt) continue;
     for (let b = 0; b < task.batches; b++) {
-      batches.push({ task, pt, batchNum: b + 1, wo: woCnt++ });
+      // 支持自定义 wo (用于重排时保持工单号)
+      const wo = task._woStart ? task._woStart + b : woCnt++;
+      batches.push({ task, pt, batchNum: b + 1, wo });
     }
   }
 
   const events = [];
 
   for (const batch of batches) {
-    let prevEnd = 0;
+    const batchKey = `${batch.pt.id}|${batch.wo}`;
+    const startOpIdx = batchProgress[batchKey] || 0;
 
-    for (let i = 0; i < batch.pt.ops.length; i++) {
+    // 该批次最后一个冻结工序的 endTime,作为下一道工序的 prevEnd
+    let prevEnd = minStart;
+    const frozenForBatch = frozenEvents.filter(e =>
+      e.ptId === batch.pt.id && e.wo === `WO-${String(batch.wo).padStart(3,"0")}`
+    );
+    if (frozenForBatch.length) {
+      prevEnd = Math.max(prevEnd, ...frozenForBatch.map(e => e.end));
+    }
+
+    for (let i = startOpIdx; i < batch.pt.ops.length; i++) {
       const op = batch.pt.ops[i];
-      const totalDur = op.dur + (op.cleanDur || 0) + (op.agv || 0);   // 工序总时长 = 加工 + 清洗 + AGV运输
+      const totalDur = op.dur + (op.cleanDur || 0) + (op.agv || 0);
 
-      let minS = prevEnd;
+      let minS = Math.max(prevEnd, minStart);
 
-      const start = findSlot(tls[op.eq], minS, totalDur, cst, workerTl, op.workers);
+      const start = findSlot(op.eq, tls[op.eq], minS, totalDur, cst, workerTl, op.workers, failures);
       const end   = start + totalDur;
 
       const extras = [op.cleanDur > 0 && `清洗${op.cleanDur}h`, op.agv > 0 && `AGV${op.agv}h`].filter(Boolean);
@@ -209,13 +252,117 @@ function runSchedule(plan, types, cst) {
         eq: op.eq, start, end, dur: totalDur, workers: op.workers,
         isCleaning: false,
         note: batch.task.note,
+        isNew: true,        // 标记为重排产生(便于UI区分)
       });
-      addTL(op.eq, start, end, op.workers);
+
+      if (!tls[op.eq]) tls[op.eq] = [];
+      tls[op.eq].push({ start, end });
+      tls[op.eq].sort((a, b) => a.start - b.start);
+      if (op.workers > 0) workerTl.push({ start, end, workers: op.workers });
+
       prevEnd = end;
     }
   }
 
   return events.sort((a, b) => a.start - b.start);
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  Reschedule (动态重调度)
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * 根据当前时刻 + 新故障 + 新插单,产生新的排产
+ * @param {Object} params
+ *   - currentEvents   现有排产结果
+ *   - plan            原 plan(已含可能的新插单任务)
+ *   - types
+ *   - cst
+ *   - rescheduleAt    重调度基准时刻(小时,以周一00:00为原点)
+ *   - failures        设备故障列表
+ *   - newTasks        新插单任务列表(优先级用户自填)
+ */
+function reschedule({ currentEvents, plan, types, cst, rescheduleAt, failures, newTasks }) {
+  // 1. 分类已有工序
+  const frozen = [];                     // 已完成 OR 进行中(且未被故障中断)
+  const cancelled = [];                  // 进行中遇故障 → 强制中断作废
+  const batchProgress = {};              // { "ptId|wo": nextOpIdx }
+  const cancelledBatchKeys = new Set();  // 需要从中断工序起重排的批次
+
+  for (const e of currentEvents) {
+    const batchKey = `${e.ptId}|${parseInt(e.wo.replace("WO-",""),10)}`;
+
+    if (e.end <= rescheduleAt) {
+      // 已完成
+      frozen.push(e);
+      batchProgress[batchKey] = Math.max(batchProgress[batchKey] || 0, e.opIdx + 1);
+    } else if (e.start <= rescheduleAt) {
+      // 进行中:检查是否被故障打断
+      const failEnd = overlapsFailure(e.eq, e.start, e.end - e.start, failures);
+      if (failEnd != null && failEnd > rescheduleAt) {
+        // 被故障中断 → 作废,从该工序重排
+        cancelled.push(e);
+        cancelledBatchKeys.add(batchKey);
+        // batchProgress 保持指向该工序(opIdx),即从这道工序重排
+        batchProgress[batchKey] = Math.min(
+          batchProgress[batchKey] !== undefined ? batchProgress[batchKey] : Infinity,
+          e.opIdx
+        );
+      } else {
+        // 正常进行,允许其完成
+        frozen.push(e);
+        batchProgress[batchKey] = Math.max(batchProgress[batchKey] || 0, e.opIdx + 1);
+      }
+    } else {
+      // 未开始 → 待重排
+      // batchProgress 取该批次未冻结工序中最小 opIdx
+      if (batchProgress[batchKey] === undefined || batchProgress[batchKey] > e.opIdx) {
+        // 仅当尚未被冻结工序覆盖时才更新
+      }
+    }
+  }
+
+  // 校正 batchProgress: 对每个批次,确保 progress = max(已冻结工序的 opIdx) + 1
+  // 已在上面 frozen 路径处理;cancelled 路径覆盖回中断工序。
+
+  // 2. 标记冻结工序
+  const frozenMarked = frozen.map(e => ({
+    ...e, locked: true, isNew: false,
+    status: e.end <= rescheduleAt ? 'DONE' : 'RUNNING',
+  }));
+
+  // 3. 构造重排用 plan
+  //    - 原任务保留(批次数不变),内部依赖 batchProgress 跳过已完成工序
+  //    - 新插单任务追加
+  const planForReschedule = [
+    ...plan.map(t => ({ ...t })),
+    ...newTasks.map(t => ({ ...t, _isNew: true })),
+  ];
+
+  // 4. 调用 runSchedule 重排
+  const newEvents = runSchedule(planForReschedule, types, cst, {
+    frozenEvents: frozenMarked,
+    failures,
+    minStart: rescheduleAt,
+    batchProgress,
+  });
+
+  // 5. 合并:冻结 + 新排
+  const merged = [
+    ...frozenMarked,
+    ...newEvents.filter(e => !frozenMarked.some(f =>
+      f.wo === e.wo && f.opIdx === e.opIdx
+    )),
+  ].sort((a, b) => a.start - b.start);
+
+  return {
+    events: merged,
+    stats: {
+      frozenCount: frozenMarked.length,
+      cancelledCount: cancelled.length,
+      newCount: newEvents.length,
+    },
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -234,6 +381,18 @@ function fmtTime(t) {
 function fmtDur(h) {
   const hrs = Math.floor(h), mins = Math.round((h % 1) * 60);
   return mins ? `${hrs}h${mins}m` : `${hrs}h`;
+}
+
+// "周X HH:MM" 字符串 → 绝对小时
+function parseTimeStr(s) {
+  // 接受 "周一 09:30" 或 "1 09:30" 形式
+  if (!s) return 0;
+  const m = s.trim().match(/^(?:周([一二三四五六日])|(\d+))\s+(\d{1,2}):(\d{1,2})$/);
+  if (!m) return null;
+  const dayMap = {"一":0,"二":1,"三":2,"四":3,"五":4,"六":5,"日":6};
+  const day = m[1] != null ? dayMap[m[1]] : (parseInt(m[2],10)-1);
+  const hh = parseInt(m[3],10), mm = parseInt(m[4],10);
+  return day * 24 + hh + mm/60;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -269,12 +428,15 @@ const Badge = ({color,bg,children,style={}}) => (
     marginRight:3,...style}}>{children}</span>
 );
 
-const Btn = ({onClick,disabled,primary,children,style={}}) => (
+const Btn = ({onClick,disabled,primary,danger,children,style={}}) => (
   <button onClick={onClick} disabled={disabled}
-    style={{padding:"6px 16px",borderRadius:7,border:`1px solid ${primary?C.accent:C.border2}`,
+    style={{padding:"6px 16px",borderRadius:7,
+      border:`1px solid ${danger?C.danger:primary?C.accent:C.border2}`,
       cursor:disabled?"not-allowed":"pointer",fontSize:12,fontWeight:600,
-      background:primary?`linear-gradient(135deg,${C.accent},#1d4ed8)`:C.surface,
-      color:primary?"white":C.t1,boxShadow:primary?"0 1px 3px rgba(0,0,0,.15)":"none",
+      background:danger?`linear-gradient(135deg,${C.danger},#b91c1c)`
+              :primary?`linear-gradient(135deg,${C.accent},#1d4ed8)`:C.surface,
+      color:(primary||danger)?"white":C.t1,
+      boxShadow:(primary||danger)?"0 1px 3px rgba(0,0,0,.15)":"none",
       opacity:disabled?0.5:1,...style}}>{children}</button>
 );
 
@@ -305,10 +467,10 @@ const Stepper = ({value,onChange,min=1,max=10,color=C.t0}) => (
 );
 
 // ══════════════════════════════════════════════════════════════════
-//  Gantt Chart (SVG, working-hours only on X-axis)
+//  Gantt Chart
 // ══════════════════════════════════════════════════════════════════
 
-function GanttChart({events, cst}) {
+function GanttChart({events, cst, rescheduleAt, failures}) {
   if (!events.length) return (
     <div style={{textAlign:"center",padding:60,color:C.t3}}>
       <div style={{fontSize:44,marginBottom:12}}>📊</div>
@@ -320,7 +482,6 @@ function GanttChart({events, cst}) {
   const maxT = events.reduce((mx,e)=>Math.max(mx,e.end),0);
   const totalDays = Math.min(cst.workDays, Math.ceil(maxT/24)+1);
 
-  // Convert absolute hour → compressed display X (skip non-working hours)
   const toX = t => {
     const day = Math.floor(t/24);
     const h   = t%24;
@@ -328,7 +489,7 @@ function GanttChart({events, cst}) {
     return day * shiftLen + dh;
   };
 
-  const activeEqs = EQ_ORDER.filter(eq => events.some(e=>e.eq===eq));
+  const activeEqs = EQ_ORDER.filter(eq => events.some(e=>e.eq===eq) || (failures||[]).some(f=>f.eq===eq));
   const PX=44, ROW=42, LBL=82, HDR=46, PAD=12;
   const W = LBL + totalDays*shiftLen*PX + PAD;
   const H = HDR + activeEqs.length*ROW + 4;
@@ -352,7 +513,6 @@ function GanttChart({events, cst}) {
           </g>
         ))}
 
-        {/* Hour ticks */}
         {Array.from({length:totalDays},(_,d)=>
           Array.from({length:shiftLen+1},(_,h)=>(
             <g key={`${d}-${h}`}>
@@ -368,8 +528,20 @@ function GanttChart({events, cst}) {
           ))
         )}
 
-        {/* Header divider */}
         <line x1={0} y1={HDR} x2={W} y2={HDR} stroke="#cbd5e1" strokeWidth={1.5}/>
+
+        {/* 重调度基准时刻 红色竖线 */}
+        {rescheduleAt != null && rescheduleAt < totalDays * 24 && (
+          <g>
+            <line x1={LBL + toX(rescheduleAt)*PX} y1={HDR}
+                  x2={LBL + toX(rescheduleAt)*PX} y2={H}
+                  stroke={C.danger} strokeWidth={1.5} strokeDasharray="4,3"/>
+            <rect x={LBL + toX(rescheduleAt)*PX - 22} y={HDR - 14}
+                  width={44} height={13} rx={3} fill={C.danger}/>
+            <text x={LBL + toX(rescheduleAt)*PX} y={HDR - 4} textAnchor="middle"
+                  fontSize={9} fontWeight="700" fill="white">NOW</text>
+          </g>
+        )}
 
         {/* Equipment rows */}
         {activeEqs.map((eq,ri)=>{
@@ -382,21 +554,39 @@ function GanttChart({events, cst}) {
               <text x={LBL-8} y={y+ROW/2+4} textAnchor="end"
                 fontSize={11} fontWeight="600" fill={C.t1} fontFamily="sans-serif">{eq}</text>
 
+              {/* 故障窗口背景 */}
+              {(failures||[]).filter(f=>f.eq===eq).map((f,fi)=>{
+                const fx1 = LBL + toX(f.start)*PX;
+                const fx2 = LBL + toX(f.end)*PX;
+                return (
+                  <g key={`f${fi}`}>
+                    <rect x={fx1} y={y+2} width={Math.max(fx2-fx1,2)} height={ROW-4}
+                      fill="url(#failurePattern)" opacity={0.7}/>
+                    <rect x={fx1} y={y+2} width={Math.max(fx2-fx1,2)} height={ROW-4}
+                      fill="none" stroke={C.danger} strokeWidth={1} strokeDasharray="3,2"/>
+                  </g>
+                );
+              })}
+
               {events.filter(e=>e.eq===eq).map((evt,ei)=>{
                 const x1 = LBL + toX(evt.start)*PX;
                 const x2 = LBL + toX(evt.end)*PX;
                 const bw = Math.max(x2-x1-2, 2);
                 const col = evt.isCleaning ? CLEAN_COL : evt.ptColor;
-                const alpha = evt.isCleaning ? 0.35 : 0.88;
+                const isLocked = evt.locked;
+                const alpha = evt.isCleaning ? 0.35 : isLocked ? 0.45 : 0.92;
                 return (
                   <g key={ei}>
                     <rect x={x1+1} y={y+5} width={bw} height={ROW-10}
-                      fill={col} opacity={alpha} rx={3}/>
+                      fill={col} opacity={alpha} rx={3}
+                      stroke={isLocked ? "#475569" : (evt.isNew ? "#fbbf24" : "none")}
+                      strokeWidth={isLocked || evt.isNew ? 1.5 : 0}
+                      strokeDasharray={isLocked ? "0" : evt.isNew ? "2,1" : "0"}/>
                     {bw>28&&(
                       <text x={x1+bw/2+1} y={y+ROW/2+2} textAnchor="middle"
                         fontSize={9} fontWeight="700" fontFamily="sans-serif"
                         fill={evt.isCleaning?C.t2:"white"}>
-                        {evt.isCleaning?"🧹清洗":evt.opName}
+                        {isLocked && "🔒"}{evt.isCleaning?"🧹清洗":evt.opName}
                       </text>
                     )}
                     {bw>50&&!evt.isCleaning&&(
@@ -412,13 +602,20 @@ function GanttChart({events, cst}) {
             </g>
           );
         })}
+
+        <defs>
+          <pattern id="failurePattern" patternUnits="userSpaceOnUse" width={6} height={6}>
+            <rect width={6} height={6} fill="#fee2e2"/>
+            <line x1={0} y1={6} x2={6} y2={0} stroke={C.danger} strokeWidth={1}/>
+          </pattern>
+        </defs>
       </svg>
     </div>
   );
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  Work Order Table (工单)
+//  Work Order Table
 // ══════════════════════════════════════════════════════════════════
 
 function WorkOrderTable({events}) {
@@ -433,7 +630,7 @@ function WorkOrderTable({events}) {
       <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
         <thead>
           <tr style={{background:"#f8fafc"}}>
-            {["工单号","批次","工序","设备","计划开始","计划完成","工时","人员","备注"].map(h=>(
+            {["状态","工单号","批次","工序","设备","计划开始","计划完成","工时","人员","备注"].map(h=>(
               <th key={h} style={{padding:"8px 10px",textAlign:"left",fontSize:10,fontWeight:700,
                 textTransform:"uppercase",color:C.t3,borderBottom:`1px solid ${C.border}`,
                 whiteSpace:"nowrap"}}>{h}</th>
@@ -443,9 +640,18 @@ function WorkOrderTable({events}) {
         <tbody>
           {events.map((e,i)=>{
             const isCl = e.isCleaning;
+            const status = e.locked
+              ? (e.status === 'DONE' ? {l:"已完成",c:C.t3,bg:"#f1f5f9"} : {l:"进行中",c:C.warn,bg:"#fef3c7"})
+              : e.isNew ? {l:"新排",c:C.dn,bg:"#dcfce7"} : {l:"待排",c:C.accent,bg:C.accentBg};
             return (
               <tr key={i} style={{background:isCl?"#f8fafc":i%2===0?C.surface:"#fafafa",
                 borderBottom:`1px solid ${C.border}`}}>
+                <td style={{padding:"7px 10px"}}>
+                  <span style={{fontSize:10,padding:"2px 7px",borderRadius:4,
+                    background:status.bg,color:status.c,fontWeight:700}}>
+                    {status.l}
+                  </span>
+                </td>
                 <td style={{padding:"7px 10px",fontFamily:"monospace",color:C.t3,fontSize:11}}>
                   {e.wo}
                 </td>
@@ -486,6 +692,250 @@ function WorkOrderTable({events}) {
 }
 
 // ══════════════════════════════════════════════════════════════════
+//  Reschedule Modal (动态重排)
+// ══════════════════════════════════════════════════════════════════
+
+function RescheduleModal({open, onClose, onConfirm, types, currentEvents, currentMakespan, cst}) {
+  const [rescheduleAtStr, setRescheduleAtStr] = useState("");
+  const [failures, setFailures] = useState([]);
+  const [newTasks, setNewTasks] = useState([]);
+
+  // 打开时,默认 now (按 currentEvents 中存在的最早未完成工序起点 OR 0)
+  useEffect(()=>{
+    if (open) {
+      // 默认设为"现在":取最早未完成工序的 start,若全部完成则取 makespan/2
+      const upcoming = currentEvents.filter(e => !e.locked).map(e=>e.start);
+      const def = upcoming.length ? Math.min(...upcoming) : 0;
+      setRescheduleAtStr(fmtTime(def));
+      setFailures([]);
+      setNewTasks([]);
+    }
+  }, [open]);
+
+  if (!open) return null;
+
+  const rescheduleAt = parseTimeStr(rescheduleAtStr);
+  const validTime = rescheduleAt != null;
+
+  // 影响预估
+  let frozenCnt = 0, runningCnt = 0, pendingCnt = 0, cancelledCnt = 0;
+  if (validTime) {
+    for (const e of currentEvents) {
+      if (e.end <= rescheduleAt) frozenCnt++;
+      else if (e.start <= rescheduleAt) {
+        const failEnd = overlapsFailure(e.eq, e.start, e.end - e.start, failures);
+        if (failEnd != null && failEnd > rescheduleAt) cancelledCnt++;
+        else runningCnt++;
+      } else pendingCnt++;
+    }
+  }
+
+  const addFailure = () => {
+    setFailures(p=>[...p, {id:uid(), eq:EQ_ORDER[2], startStr:fmtTime(rescheduleAt||0), endStr:fmtTime((rescheduleAt||0)+4), reason:"设备故障"}]);
+  };
+  const updFailure = (id,k,v) => setFailures(p=>p.map(f=>f.id===id?{...f,[k]:v}:f));
+  const delFailure = id => setFailures(p=>p.filter(f=>f.id!==id));
+
+  const addNewTask = () => {
+    if (!types.length) return;
+    setNewTasks(p=>[...p,{id:uid(),typeId:types[0].id,batches:1,priority:0,note:"插单"}]);
+  };
+  const updNewTask = (id,k,v) => setNewTasks(p=>p.map(t=>t.id===id?{...t,[k]:v}:t));
+  const delNewTask = id => setNewTasks(p=>p.filter(t=>t.id!==id));
+
+  const handleConfirm = () => {
+    if (!validTime) { alert("请输入合法的时间格式,例如:周一 09:30"); return; }
+
+    // 转换 failures 时间字符串为绝对小时
+    const failuresParsed = failures.map(f=>({
+      eq: f.eq,
+      start: parseTimeStr(f.startStr),
+      end:   parseTimeStr(f.endStr),
+      reason: f.reason,
+    })).filter(f=>f.start!=null && f.end!=null && f.end > f.start);
+
+    if (failures.length && failuresParsed.length !== failures.length) {
+      alert("故障窗口时间格式有误,请检查");
+      return;
+    }
+
+    onConfirm({
+      rescheduleAt,
+      failures: failuresParsed,
+      newTasks: newTasks.map(({id,...rest})=>({...rest, id:uid()})),
+    });
+  };
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,0.55)",
+      display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:20}}
+      onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()}
+        style={{background:C.surface,borderRadius:12,maxWidth:780,width:"100%",
+          maxHeight:"90vh",overflowY:"auto",boxShadow:"0 20px 50px rgba(0,0,0,.3)"}}>
+
+        <div style={{padding:"16px 22px",borderBottom:`1px solid ${C.border}`,
+          display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <div style={{fontSize:16,fontWeight:800,color:C.t0}}>🔄 动态重调度</div>
+            <div style={{fontSize:11,color:C.t3,marginTop:2}}>
+              冻结已完成/进行中工序 · 根据当前环境重排剩余工序
+            </div>
+          </div>
+          <button onClick={onClose} style={{padding:"4px 10px",borderRadius:6,
+            border:`1px solid ${C.border2}`,background:C.surface,cursor:"pointer",
+            color:C.t2,fontSize:18,lineHeight:1}}>✕</button>
+        </div>
+
+        <div style={{padding:"18px 22px"}}>
+
+          {/* 重调度基准时刻 */}
+          <div style={{marginBottom:18}}>
+            <SecHead icon="⏰">重调度基准时刻 (NOW)</SecHead>
+            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+              <input value={rescheduleAtStr}
+                onChange={e=>setRescheduleAtStr(e.target.value)}
+                placeholder="例:周二 14:30"
+                style={{padding:"6px 10px",borderRadius:6,border:`1px solid ${C.border2}`,
+                  fontSize:13,fontFamily:"monospace",width:160,outline:"none",
+                  background:validTime?C.surface:"#fef2f2"}}/>
+              <span style={{fontSize:11,color:C.t3}}>
+                格式:周X HH:MM &nbsp;|&nbsp; 当前完工:{fmtTime(currentMakespan)}
+              </span>
+              <Btn onClick={()=>{
+                const upcoming = currentEvents.filter(e => !e.locked).map(e=>e.start);
+                const def = upcoming.length ? Math.min(...upcoming) : 0;
+                setRescheduleAtStr(fmtTime(def));
+              }}>↻ 重置</Btn>
+            </div>
+          </div>
+
+          {/* 设备故障 */}
+          <div style={{marginBottom:18}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <SecHead icon="⚠️" color={C.danger} style={{margin:0}}>设备故障窗口</SecHead>
+              <Btn onClick={addFailure}>＋ 添加故障</Btn>
+            </div>
+            {failures.length===0 && (
+              <div style={{padding:"10px 14px",fontSize:11,color:C.t3,
+                background:"#f8fafc",borderRadius:6,border:`1px dashed ${C.border}`}}>
+                暂无故障 — 如有设备宕机,点击「+ 添加故障」录入故障窗口
+              </div>
+            )}
+            {failures.map(f=>(
+              <div key={f.id} style={{display:"flex",gap:6,alignItems:"center",
+                padding:"8px 10px",marginBottom:6,borderRadius:6,
+                background:C.dangerBg,border:`1px solid #fecaca`}}>
+                <select value={f.eq} onChange={e=>updFailure(f.id,"eq",e.target.value)}
+                  style={{padding:"3px 6px",borderRadius:5,border:`1px solid ${C.border2}`,
+                    fontSize:11,outline:"none"}}>
+                  {EQ_ORDER.map(eq=><option key={eq} value={eq}>{eq}</option>)}
+                </select>
+                <span style={{fontSize:10,color:C.t2}}>从</span>
+                <input value={f.startStr}
+                  onChange={e=>updFailure(f.id,"startStr",e.target.value)}
+                  placeholder="周X HH:MM"
+                  style={{padding:"3px 6px",borderRadius:5,border:`1px solid ${C.border2}`,
+                    fontSize:11,fontFamily:"monospace",width:110,outline:"none"}}/>
+                <span style={{fontSize:10,color:C.t2}}>至</span>
+                <input value={f.endStr}
+                  onChange={e=>updFailure(f.id,"endStr",e.target.value)}
+                  placeholder="周X HH:MM"
+                  style={{padding:"3px 6px",borderRadius:5,border:`1px solid ${C.border2}`,
+                    fontSize:11,fontFamily:"monospace",width:110,outline:"none"}}/>
+                <input value={f.reason}
+                  onChange={e=>updFailure(f.id,"reason",e.target.value)}
+                  placeholder="原因"
+                  style={{flex:1,padding:"3px 6px",borderRadius:5,
+                    border:`1px solid ${C.border2}`,fontSize:11,outline:"none"}}/>
+                <button onClick={()=>delFailure(f.id)}
+                  style={{padding:"2px 7px",borderRadius:4,border:"1px solid #fca5a5",
+                    cursor:"pointer",background:"white",color:C.danger,fontSize:11}}>✕</button>
+              </div>
+            ))}
+          </div>
+
+          {/* 新插单 */}
+          <div style={{marginBottom:18}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <SecHead icon="🆕" color={C.dn} style={{margin:0}}>新增插单任务</SecHead>
+              <Btn onClick={addNewTask}>＋ 新增插单</Btn>
+            </div>
+            {newTasks.length===0 && (
+              <div style={{padding:"10px 14px",fontSize:11,color:C.t3,
+                background:"#f8fafc",borderRadius:6,border:`1px dashed ${C.border}`}}>
+                暂无插单 — 如有紧急任务,点击「+ 新增插单」并设置优先级(0=最高)
+              </div>
+            )}
+            {newTasks.map(t=>{
+              const pt = types.find(x=>x.id===t.typeId);
+              return (
+                <div key={t.id} style={{display:"flex",gap:8,alignItems:"center",
+                  padding:"8px 10px",marginBottom:6,borderRadius:6,
+                  background:C.dnBg,border:`1px solid ${C.dnBdr}`}}>
+                  <span style={{fontSize:10,color:C.t2}}>优先级</span>
+                  <input type="number" min={0} max={99} value={t.priority}
+                    onChange={e=>updNewTask(t.id,"priority",+e.target.value)}
+                    style={{width:50,padding:"3px 6px",borderRadius:5,
+                      border:`1px solid ${C.border2}`,fontSize:11,
+                      fontFamily:"monospace",textAlign:"center",outline:"none"}}/>
+                  <span style={{fontSize:10,color:C.t2}}>型号</span>
+                  <select value={t.typeId} onChange={e=>updNewTask(t.id,"typeId",e.target.value)}
+                    style={{padding:"3px 6px",borderRadius:5,border:`1px solid ${C.border2}`,
+                      fontSize:11,outline:"none"}}>
+                    {types.map(x=><option key={x.id} value={x.id}>{x.code}</option>)}
+                  </select>
+                  {pt&&<div style={{width:8,height:8,borderRadius:2,background:pt.color}}/>}
+                  <span style={{fontSize:10,color:C.t2}}>批次</span>
+                  <Stepper value={t.batches} min={1} max={20}
+                    onChange={v=>updNewTask(t.id,"batches",v)} color={pt?.color||C.t0}/>
+                  <input value={t.note}
+                    onChange={e=>updNewTask(t.id,"note",e.target.value)}
+                    placeholder="备注"
+                    style={{flex:1,padding:"3px 6px",borderRadius:5,
+                      border:`1px solid ${C.border2}`,fontSize:11,outline:"none"}}/>
+                  <button onClick={()=>delNewTask(t.id)}
+                    style={{padding:"2px 7px",borderRadius:4,border:"1px solid #fca5a5",
+                      cursor:"pointer",background:"white",color:C.danger,fontSize:11}}>✕</button>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 影响预估 */}
+          <div style={{padding:"12px 14px",borderRadius:8,background:C.accentBg,
+            border:`1px solid ${C.accentBdr}`,marginBottom:14}}>
+            <SecHead color={C.accent} icon="📊" style={{margin:"0 0 8px"}}>影响预估</SecHead>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
+              {[
+                ["已完成(冻结)",frozenCnt,C.t3],
+                ["进行中(冻结)",runningCnt,C.warn],
+                ["待重排",pendingCnt,C.accent],
+                ["故障作废",cancelledCnt,C.danger],
+              ].map(([l,v,c])=>(
+                <div key={l} style={{textAlign:"center",padding:"6px",
+                  background:C.surface,borderRadius:5}}>
+                  <div style={{fontSize:10,color:C.t3}}>{l}</div>
+                  <div style={{fontSize:16,fontWeight:800,color:c,fontFamily:"monospace"}}>{v}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div style={{padding:"12px 22px",borderTop:`1px solid ${C.border}`,
+          display:"flex",justifyContent:"flex-end",gap:8,background:"#f8fafc"}}>
+          <Btn onClick={onClose}>取消</Btn>
+          <Btn primary onClick={handleConfirm} disabled={!validTime}>
+            🔄 执行重排
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  App
 // ══════════════════════════════════════════════════════════════════
 
@@ -494,16 +944,21 @@ export default function App() {
   const [plan,   setPlan]   = useState(DEFAULT_PLAN);
   const [cst,    setCst]    = useState(DEFAULT_CST);
   const [events, setEvents] = useState([]);
-  const [tab,    setTab]    = useState("plan");       // plan | types | cst | result
-  const [view,   setView]   = useState("gantt");      // gantt | workorder
-  const [algo,   setAlgo]   = useState("greedy");     // greedy | hgnn-ppo
+  const [tab,    setTab]    = useState("plan");
+  const [view,   setView]   = useState("gantt");
+  const [algo,   setAlgo]   = useState("greedy");
   const [loading, setLoading] = useState(false);
   const [openType, setOpenType] = useState({pt1:true});
+
+  // ── 重调度状态 ─────────────────────────────────────────────────
+  const [rescheduleOpen, setRescheduleOpen] = useState(false);
+  const [rescheduleAt, setRescheduleAt]     = useState(null);   // 上次重排基准时刻
+  const [failures, setFailures]             = useState([]);     // 已生效的故障窗口
+  const [reschedHistory, setReschedHistory] = useState([]);     // 重排历史记录
 
   const typeMap = useMemo(()=>Object.fromEntries(types.map(t=>[t.id,t])),[types]);
 
   const generate = async () => {
-    // 验证物料库存
     let needA = 0, needB = 0, needR = 0;
     for (const task of plan) {
       const pt = typeMap[task.typeId];
@@ -526,10 +981,12 @@ export default function App() {
     if (algo === "greedy") {
       const result = runSchedule(plan, types, cst);
       setEvents(result);
+      setRescheduleAt(null);
+      setFailures([]);
+      setReschedHistory([]);
       setTab("result");
       setView("gantt");
     } else {
-      // HGNN+PPO 智能调度 — 调用后端 API
       setLoading(true);
       try {
         const resp = await fetch("/api/schedule/hgnn-ppo", {
@@ -541,6 +998,9 @@ export default function App() {
         const data = await resp.json();
         if (data.error) { alert("HGNN+PPO 求解失败: " + data.error); return; }
         setEvents(data.events || []);
+        setRescheduleAt(null);
+        setFailures([]);
+        setReschedHistory([]);
         setTab("result");
         setView("gantt");
       } catch (e) {
@@ -549,6 +1009,66 @@ export default function App() {
         setLoading(false);
       }
     }
+  };
+
+  // ── 重调度执行 ─────────────────────────────────────────────────
+  const handleReschedule = async ({rescheduleAt: t, failures: newFailures, newTasks}) => {
+    const allFailures = [...failures, ...newFailures];
+    const planWithNew = [...plan, ...newTasks];
+
+    const applyRescheduleResult = (merged, stats) => {
+      setPlan(planWithNew);
+      setEvents(merged);
+      setRescheduleAt(t);
+      setFailures(allFailures);
+      setReschedHistory(p=>[...p, {
+        at: t, time: new Date().toLocaleString("zh-CN"),
+        failuresAdded: newFailures.length,
+        newTasksAdded: newTasks.length,
+        stats,
+      }]);
+      setRescheduleOpen(false);
+      setTab("result");
+      setView("gantt");
+    };
+
+    if (algo === "hgnn-ppo") {
+      setLoading(true);
+      try {
+        const resp = await fetch("/api/schedule/hgnn-ppo/reschedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            plan: planWithNew,
+            types,
+            cst,
+            currentEvents: events,
+            rescheduleAt: t,
+            failures: allFailures,
+            episodes: 300,
+          }),
+        });
+        if (!resp.ok) throw new Error(`服务端错误: ${resp.status}`);
+        const data = await resp.json();
+        if (data.error) { alert("HGNN+PPO 动态重排失败: " + data.error); return; }
+        applyRescheduleResult(data.events || [], data.stats || {});
+      } catch (e) {
+        alert("HGNN+PPO 动态重排失败，请确保后端服务已启动 (python server.py)\n\n" + e.message);
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    const { events: merged, stats } = reschedule({
+      currentEvents: events,
+      plan: planWithNew,
+      types, cst,
+      rescheduleAt: t,
+      failures: allFailures,
+      newTasks: [],
+    });
+    applyRescheduleResult(merged, stats);
   };
 
   // Stats
@@ -565,7 +1085,6 @@ export default function App() {
   },[events,makespan]);
 
   const planBatches  = plan.reduce((s,t)=>s+t.batches,0);
-  const missedTypes  = plan.filter(t=>!typeMap[t.typeId]);
 
   // ── 导出 PDF ──────────────────────────────────────────────────
   const exportPDF = () => {
@@ -575,6 +1094,7 @@ export default function App() {
 
     const rows = events.map((e, i) =>
       `<tr style="background:${i % 2 === 0 ? '#fff' : '#f8fafc'}">
+        <td>${e.locked?(e.status==='DONE'?'✅已完成':'⏵进行中'):e.isNew?'🆕新排':'待排'}</td>
         <td>${e.wo}</td><td>${e.batchLabel}</td><td>${e.opName}</td>
         <td>${e.eq}</td><td>${fmtTime(e.start)}</td><td>${fmtTime(e.end)}</td>
         <td>${fmtDur(e.dur)}</td><td>${e.workers}人</td><td>${e.note || "—"}</td>
@@ -606,7 +1126,7 @@ export default function App() {
       </style>
     </head><body>
       <h1>一号线排产工单</h1>
-      <div class="sub">${new Date().toLocaleString("zh-CN")}  ·  ${algoLabel}</div>
+      <div class="sub">${new Date().toLocaleString("zh-CN")}  ·  ${algoLabel}${rescheduleAt!=null?`  ·  动态重排@${fmtTime(rescheduleAt)}`:''}</div>
       <div class="kpi">
         <div class="kpi-item"><div class="label">完工时间</div><div class="val">${fmtTime(makespan)}</div></div>
         <div class="kpi-item"><div class="label">批次总数</div><div class="val">${batchCount} 批</div></div>
@@ -616,7 +1136,7 @@ export default function App() {
       <div class="util">设备利用率: ${utilItems}</div>
       <table>
         <thead><tr>
-          <th>工单号</th><th>批次</th><th>工序</th><th>设备</th>
+          <th>状态</th><th>工单号</th><th>批次</th><th>工序</th><th>设备</th>
           <th>计划开始</th><th>计划完成</th><th>工时</th><th>人员</th><th>备注</th>
         </tr></thead>
         <tbody>${rows}</tbody>
@@ -671,6 +1191,15 @@ export default function App() {
     <div style={{background:C.bg,minHeight:"100vh",color:C.t0,
       fontFamily:"'Segoe UI',system-ui,sans-serif"}}>
 
+      <RescheduleModal
+        open={rescheduleOpen}
+        onClose={()=>setRescheduleOpen(false)}
+        onConfirm={handleReschedule}
+        types={types}
+        currentEvents={events}
+        currentMakespan={makespan}
+        cst={cst}/>
+
       {/* ── Top bar ── */}
       <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,
         boxShadow:"0 1px 3px rgba(0,0,0,.05)",position:"sticky",top:0,zIndex:10}}>
@@ -698,6 +1227,7 @@ export default function App() {
           <div style={{display:"flex",alignItems:"center",gap:8}}>
             <div style={{fontSize:11,color:C.t3}}>
               {planBatches} 批 · {types.length} 型号 · {cst.workDays}天计划
+              {reschedHistory.length>0 && <span style={{color:C.warn,marginLeft:6}}>· 已重排{reschedHistory.length}次</span>}
             </div>
             <select value={algo} onChange={e=>{setAlgo(e.target.value);setEvents([]);}}
               style={{padding:"5px 8px",borderRadius:6,border:`1px solid ${C.border2}`,
@@ -757,7 +1287,7 @@ export default function App() {
                 </div>
               )}
 
-              {plan.map((task,idx)=>{
+              {plan.map((task)=>{
                 const pt = typeMap[task.typeId];
                 return (
                   <div key={task.id} style={{marginBottom:10,padding:"12px 14px",
@@ -765,15 +1295,13 @@ export default function App() {
                     background:pt?pt.color+"08":C.surface}}>
                     <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
 
-                      {/* Priority */}
                       <div style={{display:"flex",alignItems:"center",gap:4}}>
                         <span style={{fontSize:11,color:C.t3}}>优先级</span>
                         <Stepper value={task.priority}
                           onChange={v=>updTask(task.id,"priority",v)}
-                          min={1} max={10} color={C.accent}/>
+                          min={0} max={10} color={C.accent}/>
                       </div>
 
-                      {/* Product type */}
                       <div style={{display:"flex",alignItems:"center",gap:6}}>
                         <span style={{fontSize:11,color:C.t3}}>型号</span>
                         <select value={task.typeId}
@@ -789,7 +1317,6 @@ export default function App() {
                           background:pt.color,flexShrink:0}}/>}
                       </div>
 
-                      {/* Batch count */}
                       <div style={{display:"flex",alignItems:"center",gap:6}}>
                         <span style={{fontSize:11,color:C.t3}}>批次</span>
                         <Stepper value={task.batches}
@@ -798,21 +1325,18 @@ export default function App() {
                         <span style={{fontSize:11,color:C.t3}}>锅</span>
                       </div>
 
-                      {/* Note */}
                       <input value={task.note} placeholder="备注（可选）"
                         onChange={e=>updTask(task.id,"note",e.target.value)}
                         style={{flex:1,minWidth:80,padding:"4px 8px",borderRadius:5,
                           border:`1px solid ${C.border}`,background:C.surface,
                           color:C.t1,fontSize:11,outline:"none"}}/>
 
-                      {/* Delete */}
                       <button onClick={()=>delTask(task.id)}
                         style={{padding:"3px 8px",borderRadius:4,
                           border:"1px solid #fecaca",cursor:"pointer",
                           background:"#fef2f2",color:C.danger,fontSize:11}}>✕</button>
                     </div>
 
-                    {/* Process summary */}
                     {pt&&(
                       <div style={{marginTop:8,display:"flex",gap:4,flexWrap:"wrap"}}>
                         {pt.ops.map(op=>(
@@ -829,7 +1353,6 @@ export default function App() {
               })}
             </Card>
 
-            {/* Right: plan summary */}
             <div style={{display:"flex",flexDirection:"column",gap:10}}>
               <Card style={{padding:14}}>
                 <SecHead icon="📋">计划汇总</SecHead>
@@ -868,10 +1391,11 @@ export default function App() {
               <Card style={{padding:14,border:`1px solid #fde68a`,background:C.warnBg}}>
                 <SecHead color={C.warn} icon="💡">操作提示</SecHead>
                 <div style={{fontSize:12,color:C.t1,lineHeight:1.7}}>
-                  <div>① 调整优先级 → 高优先先排</div>
+                  <div>① 调整优先级 → 数值小者优先(支持0)</div>
                   <div>② 在「型号配置」修改工艺参数</div>
-                  <div>③ 在「约束参数」设置换产时间</div>
+                  <div>③ 在「约束参数」设置班次/库存</div>
                   <div>④ 点击顶部「生成排产」出结果</div>
+                  <div>⑤ 排产后可「🔄 动态重排」处理插单/故障</div>
                 </div>
               </Card>
             </div>
@@ -891,7 +1415,6 @@ export default function App() {
 
             {types.map(pt=>(
               <Card key={pt.id} style={{marginBottom:12,overflow:"hidden"}}>
-                {/* Type header */}
                 <div style={{display:"flex",alignItems:"center",gap:10,padding:"11px 14px",
                   borderBottom:`1px solid ${C.border}`,background:pt.color+"08",
                   cursor:"pointer"}}
@@ -916,7 +1439,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Operations table */}
                 {openType[pt.id]!==false&&(
                   <div style={{overflowX:"auto"}}>
                     <table style={{width:"100%",borderCollapse:"collapse",minWidth:500}}>
@@ -1051,7 +1573,6 @@ export default function App() {
               </div>
             </Card>
 
-            {/* Changeover note */}
             <Card style={{padding:14,gridColumn:"1/-1",
               border:`1px solid #fde68a`,background:C.warnBg}}>
               <SecHead color={C.warn} icon="⚠️">约束说明</SecHead>
@@ -1105,6 +1626,24 @@ export default function App() {
                   ))}
                 </div>
 
+                {/* ── 重排状态横幅 ── */}
+                {rescheduleAt!=null && (
+                  <Card style={{padding:"10px 14px",marginBottom:12,
+                    background:"linear-gradient(90deg,#fef3c7,#fef9c3)",
+                    border:`1px solid #fde68a`}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+                      <div style={{fontSize:12,color:C.t1}}>
+                        🔄 <b>动态重排已生效</b> · 基准时刻 <b style={{color:C.danger,fontFamily:"monospace"}}>{fmtTime(rescheduleAt)}</b>
+                        {failures.length>0 && <> · 故障 <b style={{color:C.danger}}>{failures.length}</b> 处</>}
+                        · 重排次数 <b>{reschedHistory.length}</b>
+                      </div>
+                      <div style={{fontSize:11,color:C.t3}}>
+                        🔒=已完成/进行中冻结 &nbsp; 🟡虚线=新排
+                      </div>
+                    </div>
+                  </Card>
+                )}
+
                 {/* ── Equipment utilization ── */}
                 <Card style={{padding:14,marginBottom:12}}>
                   <SecHead icon="🔧">设备利用率</SecHead>
@@ -1128,7 +1667,7 @@ export default function App() {
                 </Card>
 
                 {/* ── View toggle ── */}
-                <div style={{display:"flex",gap:6,marginBottom:12}}>
+                <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
                   {[["gantt","▦ 甘特图"],["workorder","📋 工单"]].map(([id,lbl])=>(
                     <button key={id} onClick={()=>setView(id)}
                       style={{padding:"6px 14px",borderRadius:7,
@@ -1138,6 +1677,9 @@ export default function App() {
                         color:view===id?C.accent:C.t2}}>{lbl}</button>
                   ))}
                   <Btn onClick={exportPDF} style={{marginLeft:4}}>📄 导出 PDF</Btn>
+                  <Btn danger onClick={()=>setRescheduleOpen(true)} style={{marginLeft:4}}>
+                    🔄 动态重排
+                  </Btn>
                   <div style={{flex:1}}/>
                   <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
                     {[...new Set(events.map(e=>e.ptCode))].map(code=>{
@@ -1154,14 +1696,42 @@ export default function App() {
 
                 {/* ── Views ── */}
                 <Card style={{padding:16}}>
-                  {view==="gantt"&&<GanttChart events={events} cst={cst}/>}
+                  {view==="gantt"&&<GanttChart events={events} cst={cst} rescheduleAt={rescheduleAt} failures={failures}/>}
                   {view==="workorder"&&<WorkOrderTable events={events}/>}
                 </Card>
+
+                {/* ── 重排历史 ── */}
+                {reschedHistory.length>0 && (
+                  <Card style={{padding:14,marginTop:12}}>
+                    <SecHead icon="📜">重排历史</SecHead>
+                    <div style={{fontSize:12,color:C.t1}}>
+                      {reschedHistory.map((h,i)=>(
+                        <div key={i} style={{padding:"6px 0",borderBottom:i<reschedHistory.length-1?`1px solid ${C.border}`:"none",
+                          display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                          <div>
+                            <Badge color={C.warn}>#{i+1}</Badge>
+                            <span style={{color:C.t2,fontSize:11}}>{h.time}</span>
+                            <span style={{marginLeft:8,fontFamily:"monospace",color:C.danger}}>
+                              基准 {fmtTime(h.at)}
+                            </span>
+                          </div>
+                          <div style={{fontSize:11,color:C.t2}}>
+                            冻结{h.stats.frozenCount} · 新排{h.stats.newCount}
+                            {h.failuresAdded>0 && <> · +故障{h.failuresAdded}</>}
+                            {h.newTasksAdded>0 && <> · +插单{h.newTasksAdded}</>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </Card>
+                )}
               </>
             )}
           </div>
         )}
       </div>
+
+      {/* <AgentWidget context={{ algo, tab, hasEvents: events.length > 0 }} /> */}
     </div>
   );
 }
