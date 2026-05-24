@@ -58,17 +58,111 @@ const DEFAULT_PLAN = [
   {id:"t2", typeId:"pt2", batches:1, priority:2, note:""},
 ];
 
+const DEFAULT_DUTY_ROSTER = [
+  { id: "d1", start: 8,  end: 12, workers: 2 },
+  { id: "d2", start: 12, end: 14, workers: 1 },
+  { id: "d3", start: 14, end: 18, workers: 2 },
+];
+
+function cloneDutyRoster(roster) {
+  return (roster || []).map(seg => ({ ...seg, id: uid() }));
+}
+
+function makeDefaultDutyWeek() {
+  return Array.from({ length: 5 }, () => cloneDutyRoster(DEFAULT_DUTY_ROSTER));
+}
+
 const DEFAULT_CST = {
-  totalWorkers   : 4,
-  stockMatA      : 200,
-  stockMatB      : 80,
-  stockRelease   : 10,
-  shiftStart     : 9,
-  shiftEnd       : 18,
-  lunchStart     : 12,
-  lunchEnd       : 13,
-  workDays       : 5,
+  stockMatA         : 200,
+  stockMatB         : 80,
+  stockRelease      : 10,
+  shiftStart        : 8,
+  shiftEnd          : 18,
+  workDays          : 5,
+  dutyRosterByDay   : makeDefaultDutyWeek(),
 };
+
+function getDutyRosterForDay(cst, dayIdx) {
+  const week = cst.dutyRosterByDay;
+  if (week?.[dayIdx]?.length) return week[dayIdx];
+  if (week?.[0]?.length) return week[0];
+  return cst.dutyRoster || [];
+}
+
+function normalizeCst(cst) {
+  const base = { ...DEFAULT_CST, ...cst };
+  if (base.dutyRosterByDay?.length) {
+    const week = [...base.dutyRosterByDay];
+    while (week.length < 5) week.push(cloneDutyRoster(DEFAULT_DUTY_ROSTER));
+    return { ...base, dutyRosterByDay: week.slice(0, 5) };
+  }
+  if (cst?.dutyRoster?.length) {
+    const template = cloneDutyRoster(cst.dutyRoster);
+    return { ...base, dutyRosterByDay: Array.from({ length: 5 }, () => cloneDutyRoster(template)) };
+  }
+  const shiftStart = cst?.shiftStart ?? DEFAULT_CST.shiftStart;
+  const shiftEnd = cst?.shiftEnd ?? DEFAULT_CST.shiftEnd;
+  const workers = cst?.totalWorkers ?? 2;
+  const single = [{ id: uid(), start: shiftStart, end: shiftEnd, workers }];
+  return { ...base, dutyRosterByDay: Array.from({ length: 5 }, () => cloneDutyRoster(single)) };
+}
+
+function validateDutyRosterForDay(cst, roster, dayLabel) {
+  const sorted = [...(roster || [])].sort((a, b) => a.start - b.start);
+  const errors = [];
+  const prefix = dayLabel ? `${dayLabel}：` : "";
+  if (!sorted.length) {
+    errors.push(`${prefix}至少需要一个时段`);
+    return errors;
+  }
+  let cursor = cst.shiftStart;
+  for (const seg of sorted) {
+    if (seg.start >= seg.end) errors.push(`${prefix}时段 ${seg.start}:00–${seg.end}:00 开始须早于结束`);
+    if (seg.start < cst.shiftStart || seg.end > cst.shiftEnd) {
+      errors.push(`${prefix}时段 ${seg.start}:00–${seg.end}:00 超出班次范围`);
+    }
+    if (seg.start < cursor) errors.push(`${prefix}时段 ${seg.start}:00–${seg.end}:00 与上一时段重叠`);
+    cursor = Math.max(cursor, seg.end);
+    if (seg.workers < 1) errors.push(`${prefix}时段 ${seg.start}:00–${seg.end}:00 在岗人数至少为 1`);
+  }
+  return errors;
+}
+
+function validateDutyRoster(cst) {
+  const nc = normalizeCst(cst);
+  const errors = [];
+  for (let d = 0; d < nc.workDays; d++) {
+    errors.push(...validateDutyRosterForDay(nc, getDutyRosterForDay(nc, d), DAYS_ZH[d]));
+  }
+  return errors;
+}
+
+function getDutyRosterGapsForDay(cst, roster) {
+  const sorted = [...(roster || [])].sort((a, b) => a.start - b.start);
+  const gaps = [];
+  let cursor = cst.shiftStart;
+  for (const seg of sorted) {
+    if (seg.start > cursor) gaps.push({ start: cursor, end: seg.start });
+    cursor = Math.max(cursor, seg.end);
+  }
+  if (cursor < cst.shiftEnd) gaps.push({ start: cursor, end: cst.shiftEnd });
+  return gaps;
+}
+
+function formatDutyRosterSummary(roster) {
+  return [...(roster || [])]
+    .sort((a, b) => a.start - b.start)
+    .map(seg => `${String(seg.start).padStart(2, "0")}–${String(seg.end).padStart(2, "0")} · ${seg.workers}人`)
+    .join(" | ");
+}
+
+function formatDutyWeekSummary(cst) {
+  const nc = normalizeCst(cst);
+  return Array.from({ length: nc.workDays }, (_, d) => {
+    const summary = formatDutyRosterSummary(getDutyRosterForDay(nc, d));
+    return `${DAYS_ZH[d]}：${summary || "未配置"}`;
+  }).join("\n");
+}
 
 // ══════════════════════════════════════════════════════════════════
 //  Scheduler Core
@@ -98,19 +192,79 @@ function nextWorkStart(t, cst) {
     const day = Math.floor(t / 24), h = t % 24;
     if (h < cst.shiftStart) { t = day * 24 + cst.shiftStart; continue; }
     if (h >= cst.shiftEnd)  { t = (day + 1) * 24 + cst.shiftStart; continue; }
-    if (h >= cst.lunchStart && h < cst.lunchEnd) { t = day * 24 + cst.lunchEnd; continue; }
     return t;
   }
   return Infinity;
 }
 
-function fitsWithoutLunch(start, dur, cst) {
-  const day = Math.floor(start / 24);
-  const ls = day * 24 + cst.lunchStart;
-  const le = day * 24 + cst.lunchEnd;
+function getDutyCapacityAt(t, cst) {
+  const dayIdx = Math.floor(t / 24);
+  const hour = t % 24;
+  for (const seg of getDutyRosterForDay(cst, dayIdx)) {
+    if (hour >= seg.start && hour < seg.end) return seg.workers;
+  }
+  return 0;
+}
+
+function countWorkersAt(workerTl, pt) {
+  let sum = 0;
+  for (const s of workerTl) {
+    if (s.start <= pt && s.end > pt) sum += s.workers;
+  }
+  return sum;
+}
+
+function collectWorkerCheckPoints(workerTl, start, end, cst) {
+  const points = new Set([start]);
+  for (const s of workerTl) {
+    if (s.end <= start || s.start >= end) continue;
+    points.add(Math.max(s.start, start));
+    if (s.end < end) points.add(s.end);
+  }
+  const startDay = Math.floor(start / 24);
+  const endDay = Math.floor(Math.max(start, end - 1e-9) / 24);
+  for (let d = startDay; d <= endDay + 1; d++) {
+    for (const seg of getDutyRosterForDay(cst, d)) {
+      const segStart = d * 24 + seg.start;
+      const segEnd = d * 24 + seg.end;
+      if (segStart >= start && segStart < end) points.add(segStart);
+      if (segEnd > start && segEnd < end) points.add(segEnd);
+    }
+  }
+  return [...points].filter(p => p >= start && p < end).sort((a, b) => a - b);
+}
+
+function workersFit(workerTl, start, dur, needed, cst) {
   const end = start + dur;
-  if (start < le && end > ls) return false;
+  const points = collectWorkerCheckPoints(workerTl, start, end, cst);
+  const checkPts = points.length ? points : [start];
+  for (const pt of checkPts) {
+    if (countWorkersAt(workerTl, pt) + needed > getDutyCapacityAt(pt, cst)) return false;
+  }
   return true;
+}
+
+function nextWorkerFreeTime(workerTl, t, dur, needed, cst) {
+  const candidates = new Set();
+  for (const s of workerTl) {
+    if (s.end > t) candidates.add(s.end);
+  }
+  const day = Math.floor(t / 24);
+  for (let d = day; d <= day + cst.workDays + 1; d++) {
+    for (const seg of getDutyRosterForDay(cst, d)) {
+      candidates.add(d * 24 + seg.start);
+      candidates.add(d * 24 + seg.end);
+    }
+  }
+  let best = Infinity;
+  for (const c of candidates) {
+    if (c <= t) continue;
+    if (workersFit(workerTl, c, dur, needed, cst)) best = Math.min(best, c);
+  }
+  if (best !== Infinity) return best;
+  const overlapping = workerTl.filter(s => s.start < t + dur && s.end > t);
+  if (overlapping.length) return Math.min(...overlapping.map(s => s.end));
+  return t + 0.5;
 }
 
 function findSlot(eq, tl, minStart, dur, cst, workerTl, workers, failures) {
@@ -125,11 +279,6 @@ function findSlot(eq, tl, minStart, dur, cst, workerTl, workers, failures) {
     const shiftEnd = dayBase + cst.shiftEnd;
     if (t + dur > shiftEnd) { t = nextWorkStart(shiftEnd, cst); continue; }
 
-    if (!fitsWithoutLunch(t, dur, cst)) {
-      t = dayBase + cst.lunchEnd;
-      continue;
-    }
-
     // 设备故障窗口
     const failEnd = overlapsFailure(eq, t, dur, failures);
     if (failEnd != null) { t = nextWorkStart(failEnd, cst); continue; }
@@ -138,37 +287,15 @@ function findSlot(eq, tl, minStart, dur, cst, workerTl, workers, failures) {
     const clash = (tl || []).find(s => s.start < t + dur && s.end > t);
     if (clash) { t = nextWorkStart(clash.end, cst); continue; }
 
-    // 人员
-    const maxConcurrent = peakWorkers(workerTl, t, t + dur);
-    if (maxConcurrent + workers > cst.totalWorkers) {
-      const overlapping = workerTl.filter(s => s.start < t + dur && s.end > t);
-      const nextFree = Math.min(...overlapping.map(s => s.end));
-      t = nextWorkStart(nextFree, cst);
+    // 人员（按值班表时段约束）
+    if (!workersFit(workerTl, t, dur, workers, cst)) {
+      t = nextWorkStart(nextWorkerFreeTime(workerTl, t, dur, workers, cst), cst);
       continue;
     }
 
     return t;
   }
   return Infinity;
-}
-
-function peakWorkers(workerTl, start, end) {
-  let max = 0;
-  const points = new Set();
-  for (const s of workerTl) {
-    if (s.end <= start || s.start >= end) continue;
-    points.add(Math.max(s.start, start));
-    points.add(s.end);
-  }
-  for (const pt of points) {
-    if (pt >= end) continue;
-    let sum = 0;
-    for (const s of workerTl) {
-      if (s.start <= pt && s.end > pt) sum += s.workers;
-    }
-    if (sum > max) max = sum;
-  }
-  return max;
 }
 
 /**
@@ -184,6 +311,7 @@ function peakWorkers(workerTl, start, end) {
  * @param {Number} [opts.consumedMatA/B/Release] 已消耗物料(从可用库存中扣除)
  */
 function runSchedule(plan, types, cst, opts = {}) {
+  cst = normalizeCst(cst);
   const {
     frozenEvents = [],
     failures = [],
@@ -210,7 +338,7 @@ function runSchedule(plan, types, cst, opts = {}) {
     if (!pt) continue;
     for (let b = 0; b < task.batches; b++) {
       // 支持自定义 wo (用于重排时保持工单号)
-      const wo = task._woStart ? task._woStart + b : woCnt++;
+      const wo = task._woStart != null ? task._woStart + b : woCnt++;
       batches.push({ task, pt, batchNum: b + 1, wo });
     }
   }
@@ -218,13 +346,15 @@ function runSchedule(plan, types, cst, opts = {}) {
   const events = [];
 
   for (const batch of batches) {
-    const batchKey = `${batch.pt.id}|${batch.wo}`;
+    const batchKey = `${batch.task.id}|${batch.batchNum}`;
     const startOpIdx = batchProgress[batchKey] || 0;
 
     // 该批次最后一个冻结工序的 endTime,作为下一道工序的 prevEnd
     let prevEnd = minStart;
+    const woStr = `WO-${String(batch.wo).padStart(3, "0")}`;
     const frozenForBatch = frozenEvents.filter(e =>
-      e.ptId === batch.pt.id && e.wo === `WO-${String(batch.wo).padStart(3,"0")}`
+      (e.taskId && e.taskId === batch.task.id && (e.batchNum ?? 1) === batch.batchNum)
+      || (!e.taskId && e.ptId === batch.pt.id && e.wo === woStr)
     );
     if (frozenForBatch.length) {
       prevEnd = Math.max(prevEnd, ...frozenForBatch.map(e => e.end));
@@ -244,6 +374,7 @@ function runSchedule(plan, types, cst, opts = {}) {
 
       events.push({
         wo: `WO-${String(batch.wo).padStart(3, "0")}`,
+        taskId: batch.task.id,
         batchLabel: `${batch.pt.code}-批${batch.batchNum}`,
         batchNum: batch.batchNum,
         ptId: batch.pt.id, ptCode: batch.pt.code, ptColor: batch.pt.color,
@@ -282,15 +413,59 @@ function runSchedule(plan, types, cst, opts = {}) {
  *   - failures        设备故障列表
  *   - newTasks        新插单任务列表(优先级用户自填)
  */
+function eventBatchKey(e) {
+  if (e.taskId) return `${e.taskId}|${e.batchNum ?? 1}`;
+  return `${e.ptId}|${parseInt(e.wo.replace("WO-", ""), 10)}`;
+}
+
+function assignStableWoForReschedule(plan, currentEvents) {
+  const taskWoMap = {};
+  for (const e of currentEvents) {
+    if (e.taskId && taskWoMap[e.taskId] === undefined) {
+      taskWoMap[e.taskId] = parseInt(e.wo.replace("WO-", ""), 10);
+    }
+  }
+  const ptBatchWo = {};
+  for (const e of currentEvents) {
+    if (e.taskId) continue;
+    const key = `${e.ptId}|${e.batchNum ?? 1}`;
+    if (ptBatchWo[key] === undefined) {
+      ptBatchWo[key] = parseInt(e.wo.replace("WO-", ""), 10);
+    }
+  }
+  const usedWos = new Set(
+    currentEvents.map(e => parseInt(e.wo.replace("WO-", ""), 10))
+  );
+  let nextWo = (usedWos.size ? Math.max(...usedWos) : 0) + 1;
+  const ptTypeAssignCount = {};
+
+  return plan.map(task => {
+    if (taskWoMap[task.id] !== undefined) {
+      return { ...task, _woStart: taskWoMap[task.id] };
+    }
+    const fk = `${task.typeId}|1`;
+    const n = ptTypeAssignCount[task.typeId] || 0;
+    ptTypeAssignCount[task.typeId] = n + 1;
+    if (task.batches === 1 && n === 0 && ptBatchWo[fk] !== undefined) {
+      return { ...task, _woStart: ptBatchWo[fk] };
+    }
+    while (usedWos.has(nextWo)) nextWo++;
+    const woStart = nextWo;
+    for (let b = 0; b < task.batches; b++) usedWos.add(woStart + b);
+    nextWo = woStart + task.batches;
+    return { ...task, _woStart: woStart };
+  });
+}
+
 function reschedule({ currentEvents, plan, types, cst, rescheduleAt, failures, newTasks }) {
   // 1. 分类已有工序
   const frozen = [];                     // 已完成 OR 进行中(且未被故障中断)
   const cancelled = [];                  // 进行中遇故障 → 强制中断作废
-  const batchProgress = {};              // { "ptId|wo": nextOpIdx }
-  const cancelledBatchKeys = new Set();  // 需要从中断工序起重排的批次
+  const batchProgress = {};              // { "taskId|batchNum": nextOpIdx }
+  const cancelledBatchKeys = new Set();
 
   for (const e of currentEvents) {
-    const batchKey = `${e.ptId}|${parseInt(e.wo.replace("WO-",""),10)}`;
+    const batchKey = eventBatchKey(e);
 
     if (e.end <= rescheduleAt) {
       // 已完成
@@ -331,13 +506,11 @@ function reschedule({ currentEvents, plan, types, cst, rescheduleAt, failures, n
     status: e.end <= rescheduleAt ? 'DONE' : 'RUNNING',
   }));
 
-  // 3. 构造重排用 plan
-  //    - 原任务保留(批次数不变),内部依赖 batchProgress 跳过已完成工序
-  //    - 新插单任务追加
-  const planForReschedule = [
+  // 3. 构造重排用 plan（保留已有批次工单号，插单分配新工单号）
+  const planForReschedule = assignStableWoForReschedule([
     ...plan.map(t => ({ ...t })),
     ...newTasks.map(t => ({ ...t, _isNew: true })),
-  ];
+  ], currentEvents);
 
   // 4. 调用 runSchedule 重排
   const newEvents = runSchedule(planForReschedule, types, cst, {
@@ -942,13 +1115,14 @@ function RescheduleModal({open, onClose, onConfirm, types, currentEvents, curren
 export default function App() {
   const [types,  setTypes]  = useState(DEFAULT_TYPES);
   const [plan,   setPlan]   = useState(DEFAULT_PLAN);
-  const [cst,    setCst]    = useState(DEFAULT_CST);
+  const [cst,    setCst]    = useState(() => normalizeCst(DEFAULT_CST));
   const [events, setEvents] = useState([]);
   const [tab,    setTab]    = useState("plan");
   const [view,   setView]   = useState("gantt");
   const [algo,   setAlgo]   = useState("greedy");
   const [loading, setLoading] = useState(false);
   const [openType, setOpenType] = useState({pt1:true});
+  const [dutyDayTab, setDutyDayTab] = useState(0);
 
   // ── 重调度状态 ─────────────────────────────────────────────────
   const [rescheduleOpen, setRescheduleOpen] = useState(false);
@@ -975,6 +1149,13 @@ export default function App() {
     if (needR > cst.stockRelease) shortage.push(`脱模剂（需${needR}，库存${cst.stockRelease}）`);
     if (shortage.length) {
       alert("物料不足！\n" + shortage.join("\n"));
+      return;
+    }
+
+    const dutyErrors = validateDutyRoster(normalizeCst(cst));
+    if (dutyErrors.length) {
+      alert("值班表配置有误，请补全后再排产：\n" + dutyErrors.join("\n"));
+      setTab("cst");
       return;
     }
 
@@ -1184,7 +1365,66 @@ export default function App() {
   };
   const delTask  = id => { setPlan(p=>p.filter(t=>t.id!==id)); setEvents([]); };
   const updTask  = (id,k,v) => { setPlan(p=>p.map(t=>t.id===id?{...t,[k]:v}:t)); setEvents([]); };
-  const updCst   = (k,v) => { setCst(p=>({...p,[k]:v})); setEvents([]); };
+  const updCst   = (k,v) => { setCst(p=>normalizeCst({...p,[k]:v})); setEvents([]); };
+  const updDutySeg = (dayIdx, id, k, v) => {
+    setCst(p => {
+      const nc = normalizeCst(p);
+      const week = nc.dutyRosterByDay.map((roster, i) =>
+        i === dayIdx
+          ? roster.map(seg => seg.id === id ? { ...seg, [k]: v } : seg)
+          : roster
+      );
+      return { ...nc, dutyRosterByDay: week };
+    });
+    setEvents([]);
+  };
+  const addDutySeg = (dayIdx) => {
+    setCst(p => {
+      const nc = normalizeCst(p);
+      const week = nc.dutyRosterByDay.map((roster, i) => {
+        if (i !== dayIdx) return roster;
+        const sorted = [...roster].sort((a, b) => a.start - b.start);
+        const lastEnd = sorted.length ? sorted[sorted.length - 1].end : nc.shiftStart;
+        const start = Math.min(lastEnd, nc.shiftEnd - 1);
+        const end = Math.min(start + 2, nc.shiftEnd);
+        return [...sorted, { id: uid(), start, end, workers: 1 }];
+      });
+      return { ...nc, dutyRosterByDay: week };
+    });
+    setEvents([]);
+  };
+  const delDutySeg = (dayIdx, id) => {
+    setCst(p => {
+      const nc = normalizeCst(p);
+      const week = nc.dutyRosterByDay.map((roster, i) =>
+        i === dayIdx ? roster.filter(seg => seg.id !== id) : roster
+      );
+      return { ...nc, dutyRosterByDay: week };
+    });
+    setEvents([]);
+  };
+  const copyDutyToAllDays = (fromDayIdx) => {
+    setCst(p => {
+      const nc = normalizeCst(p);
+      const template = cloneDutyRoster(getDutyRosterForDay(nc, fromDayIdx));
+      return {
+        ...nc,
+        dutyRosterByDay: nc.dutyRosterByDay.map((_, i) => cloneDutyRoster(template)),
+      };
+    });
+    setEvents([]);
+  };
+
+  const normCst = useMemo(() => normalizeCst(cst), [cst]);
+  const activeDutyRoster = useMemo(
+    () => getDutyRosterForDay(normCst, dutyDayTab),
+    [normCst, dutyDayTab]
+  );
+  const dutyRosterErrors = useMemo(() => validateDutyRoster(normCst), [normCst]);
+  const dutyRosterGaps = useMemo(
+    () => getDutyRosterGapsForDay(normCst, activeDutyRoster),
+    [normCst, activeDutyRoster]
+  );
 
   // ─── Render ───────────────────────────────────────────────────
   return (
@@ -1393,7 +1633,7 @@ export default function App() {
                 <div style={{fontSize:12,color:C.t1,lineHeight:1.7}}>
                   <div>① 调整优先级 → 数值小者优先(支持0)</div>
                   <div>② 在「型号配置」修改工艺参数</div>
-                  <div>③ 在「约束参数」设置班次/库存</div>
+                  <div>③ 在「约束参数」设置值班表/库存</div>
                   <div>④ 点击顶部「生成排产」出结果</div>
                   <div>⑤ 排产后可「🔄 动态重排」处理插单/故障</div>
                 </div>
@@ -1520,7 +1760,6 @@ export default function App() {
               <SecHead icon="⏱">工艺约束</SecHead>
 
               {[
-                ["totalWorkers",  "可用人员总数",   "同一时刻可并行工作的最大人数", 1, 20, 1, "人"],
                 ["stockMatA",     "原料A库存",      "当前原料A的可用库存量",       0, 9999, 1, ""],
                 ["stockMatB",     "原料B库存",      "当前原料B的可用库存量",       0, 9999, 1, ""],
                 ["stockRelease",  "脱模剂库存",     "当前脱模剂的可用库存量",       0, 9999, 0.1, ""],
@@ -1536,16 +1775,99 @@ export default function App() {
                   <div style={{fontSize:11,color:C.t3}}>{desc}</div>
                 </div>
               ))}
+
+              <div style={{marginTop:8,padding:"12px 14px",borderRadius:8,
+                border:`1px solid ${C.border}`,background:"#f8fafc"}}>
+                <div style={{display:"flex",justifyContent:"space-between",
+                  alignItems:"center",marginBottom:10}}>
+                  <SecHead icon="👥" style={{margin:0}}>值班表（按工作日）</SecHead>
+                  <div style={{display:"flex",gap:6}}>
+                    <Btn onClick={()=>copyDutyToAllDays(dutyDayTab)}>复制到全周</Btn>
+                    <Btn onClick={()=>addDutySeg(dutyDayTab)}>＋ 添加时段</Btn>
+                  </div>
+                </div>
+                <div style={{fontSize:11,color:C.t3,marginBottom:10}}>
+                  周一至周五分别配置在岗人数；空档时段不可排产（作为约束，不阻止生成）
+                </div>
+                <div style={{display:"flex",gap:4,marginBottom:12,flexWrap:"wrap"}}>
+                  {Array.from({ length: normCst.workDays }, (_, d) => (
+                    <button key={d} onClick={()=>setDutyDayTab(d)}
+                      style={{padding:"5px 12px",borderRadius:6,cursor:"pointer",fontSize:12,fontWeight:600,
+                        border:`1px solid ${dutyDayTab===d?C.accent:C.border}`,
+                        background:dutyDayTab===d?C.accentBg:C.surface,
+                        color:dutyDayTab===d?C.accent:C.t2}}>
+                      {DAYS_ZH[d]}
+                    </button>
+                  ))}
+                </div>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                  <thead>
+                    <tr style={{borderBottom:`1px solid ${C.border}`}}>
+                      {["开始","结束","在岗人数",""].map(h=>(
+                        <th key={h} style={{padding:"6px 8px",textAlign:"left",
+                          fontSize:10,color:C.t3,fontWeight:700}}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...activeDutyRoster].sort((a,b)=>a.start-b.start).map(seg=>(
+                      <tr key={seg.id} style={{borderBottom:`1px solid ${C.border}`}}>
+                        <td style={{padding:"7px 8px"}}>
+                          <NumInput value={seg.start} min={0} max={23} step={1} unit="时"
+                            onChange={v=>updDutySeg(dutyDayTab, seg.id,"start",v)}/>
+                        </td>
+                        <td style={{padding:"7px 8px"}}>
+                          <NumInput value={seg.end} min={1} max={24} step={1} unit="时"
+                            onChange={v=>updDutySeg(dutyDayTab, seg.id,"end",v)}/>
+                        </td>
+                        <td style={{padding:"7px 8px"}}>
+                          <Stepper value={seg.workers}
+                            onChange={v=>updDutySeg(dutyDayTab, seg.id,"workers",v)}
+                            min={1} max={20} color={C.t1}/>
+                        </td>
+                        <td style={{padding:"7px 8px",textAlign:"right"}}>
+                          <button onClick={()=>delDutySeg(dutyDayTab, seg.id)}
+                            disabled={activeDutyRoster.length<=1}
+                            style={{border:"none",background:"transparent",color:C.danger,
+                              cursor:activeDutyRoster.length<=1?"not-allowed":"pointer",
+                              opacity:activeDutyRoster.length<=1?0.4:1,fontSize:14}}>✕</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div style={{marginTop:10,padding:"8px 10px",borderRadius:6,
+                  background:C.accentBg,border:`1px solid ${C.accentBdr}`,
+                  fontSize:11,color:C.accent,lineHeight:1.7}}>
+                  {DAYS_ZH[dutyDayTab]}：{formatDutyRosterSummary(activeDutyRoster) || "请配置值班时段"}
+                </div>
+                {dutyRosterGaps.length>0 && (
+                  <div style={{marginTop:8,padding:"8px 10px",borderRadius:6,
+                    background:C.warnBg,border:"1px solid #fde68a",
+                    fontSize:11,color:C.warn,lineHeight:1.7}}>
+                    {dutyRosterGaps.map((g,i)=>(
+                      <div key={i}>
+                        · {DAYS_ZH[dutyDayTab]} {String(g.start).padStart(2,"0")}:00–{String(g.end).padStart(2,"0")}:00 无人在岗（该时段不可排产）
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {dutyRosterErrors.length>0 && (
+                  <div style={{marginTop:8,padding:"8px 10px",borderRadius:6,
+                    background:"#fef2f2",border:"1px solid #fecaca",
+                    fontSize:11,color:C.danger,lineHeight:1.7}}>
+                    {dutyRosterErrors.map((e,i)=><div key={i}>· {e}</div>)}
+                  </div>
+                )}
+              </div>
             </Card>
 
             <Card style={{padding:16}}>
               <SecHead icon="🕐">班次 & 计划参数</SecHead>
 
               {[
-                ["shiftStart",  "班次开始时间", "每天排产开始的小时数（24小时制）", 0, 23, 1, "时"],
-                ["shiftEnd",    "班次结束时间", "每天排产结束的小时数（24小时制）", 1, 24, 1, "时"],
-                ["lunchStart",  "午休开始时间", "午休开始的小时数（该时段不排产）",  0, 23, 1, "时"],
-                ["lunchEnd",    "午休结束时间", "午休结束的小时数",                 1, 24, 1, "时"],
+                ["shiftStart",  "班次开始时间", "每天机器开始生产的小时数（24小时制）", 0, 23, 1, "时"],
+                ["shiftEnd",    "班次结束时间", "每天机器结束生产的小时数（24小时制）", 1, 24, 1, "时"],
                 ["workDays",    "排产天数",     "本次排产周期覆盖的工作日数量",      1, 14, 1, "天"],
               ].map(([key,label,desc,min,max,step,unit])=>(
                 <div key={key} style={{marginBottom:14,padding:"11px 14px",borderRadius:8,
@@ -1566,9 +1888,10 @@ export default function App() {
                   当前有效配置
                 </SecHead>
                 <div style={{fontSize:12,color:C.accent,lineHeight:1.8}}>
-                  <div>每日工作时间：{cst.shiftEnd-cst.shiftStart-(cst.lunchEnd-cst.lunchStart)} 小时（不含午休{cst.lunchEnd-cst.lunchStart}h）</div>
-                  <div>班次：{String(cst.shiftStart).padStart(2,"0")}:00 — {String(cst.shiftEnd).padStart(2,"0")}:00 · 午休：{String(cst.lunchStart).padStart(2,"0")}:00 — {String(cst.lunchEnd).padStart(2,"0")}:00</div>
-                  <div>混合后清洗：按型号工序配置 · 可用人员：{cst.totalWorkers}人</div>
+                  <div>每日生产时间：{cst.shiftEnd - cst.shiftStart} 小时（机器连续运行，不停线）</div>
+                  <div>班次：{String(cst.shiftStart).padStart(2,"0")}:00 — {String(cst.shiftEnd).padStart(2,"0")}:00</div>
+                  <div style={{whiteSpace:"pre-line"}}>值班表：{"\n"}{formatDutyWeekSummary(normCst)}</div>
+                  <div>混合后清洗：按各型号工序配置</div>
                 </div>
               </div>
             </Card>
@@ -1576,7 +1899,7 @@ export default function App() {
             <Card style={{padding:14,gridColumn:"1/-1",
               border:`1px solid #fde68a`,background:C.warnBg}}>
               <SecHead color={C.warn} icon="⚠️">约束说明</SecHead>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,fontSize:12,color:C.t1}}>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,fontSize:12,color:C.t1}}>
                 <div style={{padding:"8px 12px",background:C.surface,borderRadius:6,
                   borderLeft:"3px solid "+C.warn}}>
                   <strong style={{color:C.warn}}>工序清洗</strong><br/>
@@ -1586,6 +1909,11 @@ export default function App() {
                   borderLeft:"3px solid "+C.dn}}>
                   <strong style={{color:C.dn}}>班次边界</strong><br/>
                   每道工序不跨班次执行。若当前班次剩余时间不足，自动顺延到下一天班次开始。
+                </div>
+                <div style={{padding:"8px 12px",background:C.surface,borderRadius:6,
+                  borderLeft:"3px solid "+C.accent}}>
+                  <strong style={{color:C.accent}}>值班表人员</strong><br/>
+                  各时段在岗人数不同；排产时工序所需人数不得超过该时段值班人数。
                 </div>
               </div>
             </Card>

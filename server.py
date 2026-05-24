@@ -48,16 +48,25 @@ class TaskDef(BaseModel):
     note: str = ""
 
 
+class DutySegDef(BaseModel):
+    id: str = ""
+    start: int
+    end: int
+    workers: int = 1
+
+
 class Constraints(BaseModel):
-    totalWorkers: int = 4
     stockMatA: float = 200
     stockMatB: float = 80
     stockRelease: float = 10
-    shiftStart: int = 9
+    shiftStart: int = 8
     shiftEnd: int = 18
+    workDays: int = 5
+    dutyRosterByDay: list[list[DutySegDef]] | None = None
+    dutyRoster: list[DutySegDef] | None = None
+    totalWorkers: int = 4
     lunchStart: int = 12
     lunchEnd: int = 13
-    workDays: int = 5
 
 
 class FailureDef(BaseModel):
@@ -69,6 +78,7 @@ class FailureDef(BaseModel):
 
 class EventDef(BaseModel):
     wo: str
+    taskId: str = ""
     batchLabel: str = ""
     batchNum: int = 1
     ptId: str
@@ -105,7 +115,166 @@ class RescheduleRequest(BaseModel):
     episodes: int = 300
 
 
-# ── 班次 / 设备槽位工具 ───────────────────────────────────────────
+# ── 值班表 / 班次 / 设备槽位工具 ─────────────────────────────────
+
+DEFAULT_DUTY_ROSTER = [
+    {"id": "d1", "start": 8, "end": 12, "workers": 2},
+    {"id": "d2", "start": 12, "end": 14, "workers": 1},
+    {"id": "d3", "start": 14, "end": 18, "workers": 2},
+]
+DAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def normalize_cst(cst):
+    if hasattr(cst, "model_dump"):
+        data = cst.model_dump()
+    else:
+        data = dict(cst)
+    base = {
+        "stockMatA": 200,
+        "stockMatB": 80,
+        "stockRelease": 10,
+        "shiftStart": 8,
+        "shiftEnd": 18,
+        "workDays": 5,
+        "dutyRosterByDay": [DEFAULT_DUTY_ROSTER[:] for _ in range(5)],
+        **data,
+    }
+    if base.get("dutyRosterByDay"):
+        week = base["dutyRosterByDay"]
+        while len(week) < 5:
+            week.append(DEFAULT_DUTY_ROSTER[:])
+        base["dutyRosterByDay"] = week[:5]
+        return base
+    if base.get("dutyRoster"):
+        template = base["dutyRoster"]
+        base["dutyRosterByDay"] = [template[:] for _ in range(5)]
+        return base
+    workers = base.get("totalWorkers", 2)
+    single = [{"start": base["shiftStart"], "end": base["shiftEnd"], "workers": workers}]
+    base["dutyRosterByDay"] = [single[:] for _ in range(5)]
+    return base
+
+
+def get_duty_roster_for_day(cst, day_idx):
+    cst = normalize_cst(cst)
+    week = cst["dutyRosterByDay"]
+    if day_idx < len(week) and week[day_idx]:
+        return week[day_idx]
+    return week[0] if week else []
+
+
+def get_duty_capacity_at(t, cst):
+    day_idx = int(t // 24)
+    hour = t % 24
+    for seg in get_duty_roster_for_day(cst, day_idx):
+        if seg["start"] <= hour < seg["end"]:
+            return seg["workers"]
+    return 0
+
+
+def count_workers_at(worker_tl, pt):
+    return sum(s["workers"] for s in worker_tl if s["start"] <= pt < s["end"])
+
+
+def collect_worker_check_points(worker_tl, start, end, cst):
+    points = {start}
+    for s in worker_tl:
+        if s["end"] <= start or s["start"] >= end:
+            continue
+        points.add(max(s["start"], start))
+        if s["end"] < end:
+            points.add(s["end"])
+    start_day = int(start // 24)
+    end_day = int(max(start, end - 1e-9) // 24)
+    for d in range(start_day, end_day + 2):
+        for seg in get_duty_roster_for_day(cst, d):
+            seg_start = d * 24 + seg["start"]
+            seg_end = d * 24 + seg["end"]
+            if start <= seg_start < end:
+                points.add(seg_start)
+            if start < seg_end < end:
+                points.add(seg_end)
+    return sorted(p for p in points if start <= p < end)
+
+
+def workers_fit(worker_tl, start, dur, needed, cst):
+    end = start + dur
+    points = collect_worker_check_points(worker_tl, start, end, cst)
+    check_pts = points or [start]
+    for pt in check_pts:
+        if count_workers_at(worker_tl, pt) + needed > get_duty_capacity_at(pt, cst):
+            return False
+    return True
+
+
+def next_worker_free_time(worker_tl, t, dur, needed, cst):
+    cst = normalize_cst(cst)
+    candidates = set()
+    for s in worker_tl:
+        if s["end"] > t:
+            candidates.add(s["end"])
+    day = int(t // 24)
+    for d in range(day, day + cst["workDays"] + 2):
+        for seg in get_duty_roster_for_day(cst, d):
+            candidates.add(d * 24 + seg["start"])
+            candidates.add(d * 24 + seg["end"])
+    best = float("inf")
+    for c in candidates:
+        if c <= t:
+            continue
+        if workers_fit(worker_tl, c, dur, needed, cst):
+            best = min(best, c)
+    if best != float("inf"):
+        return best
+    overlapping = [s["end"] for s in worker_tl if s["start"] < t + dur and s["end"] > t]
+    if overlapping:
+        return min(overlapping)
+    return t + 0.5
+
+
+def event_batch_key(e):
+    if e.get("taskId"):
+        return f"{e['taskId']}|{e.get('batchNum', 1)}"
+    return f"{e['ptId']}|{int(e['wo'].replace('WO-', ''))}"
+
+
+def assign_stable_wo_for_reschedule(plan, current_events):
+    task_wo_map = {}
+    for e in current_events:
+        if e.get("taskId") and e["taskId"] not in task_wo_map:
+            task_wo_map[e["taskId"]] = int(e["wo"].replace("WO-", ""))
+    pt_batch_wo = {}
+    for e in current_events:
+        if e.get("taskId"):
+            continue
+        key = f"{e['ptId']}|{e.get('batchNum', 1)}"
+        if key not in pt_batch_wo:
+            pt_batch_wo[key] = int(e["wo"].replace("WO-", ""))
+    used_wos = {int(e["wo"].replace("WO-", "")) for e in current_events}
+    next_wo = (max(used_wos) if used_wos else 0) + 1
+    pt_type_assign_count = {}
+
+    result = []
+    for task in plan:
+        td = task.model_dump() if hasattr(task, "model_dump") else dict(task)
+        if td["id"] in task_wo_map:
+            result.append({**td, "_woStart": task_wo_map[td["id"]]})
+            continue
+        fk = f"{td['typeId']}|1"
+        n = pt_type_assign_count.get(td["typeId"], 0)
+        pt_type_assign_count[td["typeId"]] = n + 1
+        if td["batches"] == 1 and n == 0 and fk in pt_batch_wo:
+            result.append({**td, "_woStart": pt_batch_wo[fk]})
+            continue
+        while next_wo in used_wos:
+            next_wo += 1
+        wo_start = next_wo
+        for b in range(td["batches"]):
+            used_wos.add(wo_start + b)
+        next_wo = wo_start + td["batches"]
+        result.append({**td, "_woStart": wo_start})
+    return result
 
 def overlaps_failure(eq, start, dur, failures):
     end = start + dur
@@ -117,28 +286,26 @@ def overlaps_failure(eq, start, dur, failures):
     return None
 
 
-def make_slot_finder(cst, eq_timelines, failures=None):
+def make_slot_finder(cst, eq_timelines, worker_tl, failures=None):
     failures = failures or []
+    cst = normalize_cst(cst)
 
     def next_work_start(t):
         for _ in range(500):
-            if t >= cst.workDays * 24:
+            if t >= cst["workDays"] * 24:
                 return float("inf")
             day = int(t // 24)
             h = t % 24
-            if h < cst.shiftStart:
-                t = day * 24 + cst.shiftStart
+            if h < cst["shiftStart"]:
+                t = day * 24 + cst["shiftStart"]
                 continue
-            if h >= cst.shiftEnd:
-                t = (day + 1) * 24 + cst.shiftStart
-                continue
-            if cst.lunchStart <= h < cst.lunchEnd:
-                t = day * 24 + cst.lunchEnd
+            if h >= cst["shiftEnd"]:
+                t = (day + 1) * 24 + cst["shiftStart"]
                 continue
             return t
         return float("inf")
 
-    def find_slot(eq, min_start, dur):
+    def find_slot(eq, min_start, dur, workers=1):
         t = next_work_start(min_start)
         for _ in range(50000):
             if t == float("inf"):
@@ -147,14 +314,9 @@ def make_slot_finder(cst, eq_timelines, failures=None):
             if t == float("inf"):
                 return float("inf")
             day_base = int(t // 24) * 24
-            shift_end = day_base + cst.shiftEnd
+            shift_end = day_base + cst["shiftEnd"]
             if t + dur > shift_end:
                 t = next_work_start(shift_end)
-                continue
-            ls = day_base + cst.lunchStart
-            le = day_base + cst.lunchEnd
-            if t < le and t + dur > ls:
-                t = day_base + cst.lunchEnd
                 continue
             fail_end = overlaps_failure(eq, t, dur, failures)
             if fail_end is not None:
@@ -168,6 +330,9 @@ def make_slot_finder(cst, eq_timelines, failures=None):
                     break
             if clash:
                 continue
+            if not workers_fit(worker_tl, t, dur, workers, cst):
+                t = next_work_start(next_worker_free_time(worker_tl, t, dur, workers, cst))
+                continue
             return t
         return float("inf")
 
@@ -177,13 +342,16 @@ def make_slot_finder(cst, eq_timelines, failures=None):
 def expand_batches(plan, type_map):
     batches = []
     wo_cnt = 1
-    for task in sorted(plan, key=lambda t: t.priority):
-        pt = type_map.get(task.typeId)
+    for task in sorted(plan, key=lambda t: t.priority if hasattr(t, "priority") else t["priority"]):
+        td = task.model_dump() if hasattr(task, "model_dump") else dict(task)
+        pt = type_map.get(td["typeId"])
         if not pt:
             continue
-        for b in range(task.batches):
-            batches.append({"task": task, "pt": pt, "batchNum": b + 1, "wo": wo_cnt})
-            wo_cnt += 1
+        for b in range(td["batches"]):
+            wo = td["_woStart"] + b if td.get("_woStart") is not None else wo_cnt
+            if td.get("_woStart") is None:
+                wo_cnt += 1
+            batches.append({"task": td, "pt": pt, "batchNum": b + 1, "wo": wo})
     return batches
 
 
@@ -226,6 +394,7 @@ def emit_event(batch, op, op_idx, eq, start, end, dur, is_new=False):
     op_name = op.name + (f"(含{'+ '.join(extras)})" if extras else "")
     return {
         "wo": f"WO-{str(batch['wo']).zfill(3)}",
+        "taskId": batch["task"]["id"],
         "batchLabel": f"{pt.code}-批{batch['batchNum']}",
         "batchNum": batch["batchNum"],
         "ptId": pt.id,
@@ -239,14 +408,19 @@ def emit_event(batch, op, op_idx, eq, start, end, dur, is_new=False):
         "dur": dur,
         "workers": op.workers,
         "isCleaning": False,
-        "note": batch["task"].note,
+        "note": batch["task"].get("note", "") if isinstance(batch["task"], dict) else batch["task"].note,
         "isNew": is_new,
     }
 
 
 def map_hgnn_to_events(schedule, proc, batch_meta, idx_to_eq, cst, eq_timelines, job_end_times,
-                       failures=None, min_start_floor=0.0, mark_new=False):
-    find_slot = make_slot_finder(cst, eq_timelines, failures)
+                       failures=None, min_start_floor=0.0, mark_new=False, frozen_marked=None):
+    worker_tl = []
+    for e in frozen_marked or []:
+        if e.get("workers", 0) > 0:
+            worker_tl.append({"start": e["start"], "end": e["end"], "workers": e["workers"]})
+
+    find_slot = make_slot_finder(cst, eq_timelines, worker_tl, failures)
     events = []
     raw_events = []
     for (j, o), (m, start, _end) in schedule.items():
@@ -263,12 +437,14 @@ def map_hgnn_to_events(schedule, proc, batch_meta, idx_to_eq, cst, eq_timelines,
         dur = proc[j][o][m]
 
         min_start = max(job_end_times[j], min_start_floor)
-        start = find_slot(eq, min_start, dur)
+        start = find_slot(eq, min_start, dur, op.workers)
         end = start + dur
 
         eq_timelines[eq].append((start, end))
         eq_timelines[eq].sort()
         job_end_times[j] = end
+        if op.workers > 0:
+            worker_tl.append({"start": start, "end": end, "workers": op.workers})
 
         events.append(emit_event(batch, op, orig_op_idx, eq, start, end, dur, is_new=mark_new))
 
@@ -282,7 +458,7 @@ def classify_reschedule(current_events, reschedule_at, failures):
 
     for e in current_events:
         ev = e.model_dump() if hasattr(e, "model_dump") else dict(e)
-        batch_key = f"{ev['ptId']}|{int(ev['wo'].replace('WO-', ''))}"
+        batch_key = event_batch_key(ev)
 
         if ev["end"] <= reschedule_at:
             frozen.append(ev)
@@ -336,7 +512,7 @@ def run_hgnn_schedule(plan, types, cst, episodes, failures=None, frozen_marked=N
     start_op_indices = []
     active_job_indices = []
     for batch in batches:
-        batch_key = f"{batch['pt'].id}|{batch['wo']}"
+        batch_key = f"{batch['task']['id']}|{batch['batchNum']}"
         start_op = (batch_progress or {}).get(batch_key, 0)
         start_op_indices.append(start_op)
         if start_op < len(batch["pt"].ops):
@@ -382,7 +558,9 @@ def run_hgnn_schedule(plan, types, cst, episodes, failures=None, frozen_marked=N
         wo = f"WO-{str(batch['wo']).zfill(3)}"
         frozen_for_batch = [
             e for e in (frozen_marked or [])
-            if e["ptId"] == batch["pt"].id and e["wo"] == wo
+            if (e.get("taskId") and e["taskId"] == batch["task"]["id"]
+                and e.get("batchNum", 1) == batch["batchNum"])
+            or (not e.get("taskId") and e["ptId"] == batch["pt"].id and e["wo"] == wo)
         ]
         if frozen_for_batch:
             job_end_times[j] = max(job_end_times[j], *(e["end"] for e in frozen_for_batch))
@@ -390,6 +568,7 @@ def run_hgnn_schedule(plan, types, cst, episodes, failures=None, frozen_marked=N
     new_events = map_hgnn_to_events(
         schedule, proc, batch_meta, idx_to_eq, cst, eq_timelines, job_end_times,
         failures=failures, min_start_floor=reschedule_at, mark_new=bool(frozen_marked),
+        frozen_marked=frozen_marked,
     )
 
     if frozen_marked:
@@ -412,12 +591,18 @@ def schedule_hgnn_ppo(req: ScheduleRequest):
 @app.post("/api/schedule/hgnn-ppo/reschedule")
 def schedule_hgnn_reschedule(req: RescheduleRequest):
     failures = req.failures
+    current_events = [
+        e.model_dump() if hasattr(e, "model_dump") else dict(e)
+        for e in req.currentEvents
+    ]
     frozen_marked, batch_progress = classify_reschedule(
         req.currentEvents, req.rescheduleAt, failures
     )
 
+    plan_with_wo = assign_stable_wo_for_reschedule(req.plan, current_events)
+
     result = run_hgnn_schedule(
-        req.plan, req.types, req.cst, req.episodes,
+        plan_with_wo, req.types, req.cst, req.episodes,
         failures=failures,
         frozen_marked=frozen_marked,
         batch_progress=batch_progress,
