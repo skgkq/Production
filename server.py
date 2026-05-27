@@ -52,7 +52,8 @@ class DutySegDef(BaseModel):
     id: str = ""
     start: int
     end: int
-    workers: int = 1
+    names: list[str] = []
+    workers: int = 0
 
 
 class Constraints(BaseModel):
@@ -117,12 +118,57 @@ class RescheduleRequest(BaseModel):
 
 # ── 值班表 / 班次 / 设备槽位工具 ─────────────────────────────────
 
-DEFAULT_DUTY_ROSTER = [
-    {"id": "d1", "start": 8, "end": 12, "workers": 2},
-    {"id": "d2", "start": 12, "end": 14, "workers": 1},
-    {"id": "d3", "start": 14, "end": 18, "workers": 2},
+DUTY_NAME_POOL = [
+    "小李", "小高", "小吴", "小明", "小红", "小芳", "小张", "小王", "小陈", "小刘", "小赵", "小周",
 ]
 DAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def make_default_duty_day():
+    import random
+    pool = DUTY_NAME_POOL[:]
+    random.shuffle(pool)
+    idx = 0
+
+    def take(n):
+        nonlocal idx
+        names = []
+        for _ in range(n):
+            names.append(pool[idx % len(pool)])
+            idx += 1
+        return names
+
+    return [
+        normalize_duty_seg({"id": "d1", "start": 8, "end": 12, "names": take(2)}),
+        normalize_duty_seg({"id": "d2", "start": 12, "end": 14, "names": take(1)}),
+        normalize_duty_seg({"id": "d3", "start": 14, "end": 18, "names": take(2)}),
+    ]
+
+
+def seg_duty_count(seg):
+    if isinstance(seg, dict):
+        names = seg.get("names") or []
+        if names:
+            return len(names)
+        return seg.get("workers") or 0
+    names = getattr(seg, "names", None) or []
+    if names:
+        return len(names)
+    return getattr(seg, "workers", 0) or 0
+
+
+def normalize_duty_seg(seg):
+    if hasattr(seg, "model_dump"):
+        data = dict(seg.model_dump())
+    else:
+        data = dict(seg)
+    names = [str(n).strip() for n in (data.get("names") or []) if str(n).strip()]
+    if not names and (data.get("workers") or 0) > 0:
+        for i in range(data["workers"]):
+            names.append(f"人员{i + 1}")
+    data["names"] = names
+    data["workers"] = len(names)
+    return data
 
 
 def normalize_cst(cst):
@@ -137,13 +183,13 @@ def normalize_cst(cst):
         "shiftStart": 8,
         "shiftEnd": 18,
         "workDays": 5,
-        "dutyRosterByDay": [DEFAULT_DUTY_ROSTER[:] for _ in range(5)],
+        "dutyRosterByDay": [make_default_duty_day() for _ in range(5)],
         **data,
     }
     if base.get("dutyRosterByDay"):
-        week = base["dutyRosterByDay"]
+        week = [[normalize_duty_seg(seg) for seg in day] for day in base["dutyRosterByDay"]]
         while len(week) < 5:
-            week.append(DEFAULT_DUTY_ROSTER[:])
+            week.append(make_default_duty_day())
         base["dutyRosterByDay"] = week[:5]
         return base
     if base.get("dutyRoster"):
@@ -151,8 +197,12 @@ def normalize_cst(cst):
         base["dutyRosterByDay"] = [template[:] for _ in range(5)]
         return base
     workers = base.get("totalWorkers", 2)
-    single = [{"start": base["shiftStart"], "end": base["shiftEnd"], "workers": workers}]
-    base["dutyRosterByDay"] = [single[:] for _ in range(5)]
+    single = normalize_duty_seg({
+        "start": base["shiftStart"],
+        "end": base["shiftEnd"],
+        "names": [f"人员{i + 1}" for i in range(workers)],
+    })
+    base["dutyRosterByDay"] = [[single] for _ in range(5)]
     return base
 
 
@@ -169,7 +219,7 @@ def get_duty_capacity_at(t, cst):
     hour = t % 24
     for seg in get_duty_roster_for_day(cst, day_idx):
         if seg["start"] <= hour < seg["end"]:
-            return seg["workers"]
+            return seg_duty_count(seg)
     return 0
 
 

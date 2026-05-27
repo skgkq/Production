@@ -58,18 +58,44 @@ const DEFAULT_PLAN = [
   {id:"t2", typeId:"pt2", batches:1, priority:2, note:""},
 ];
 
-const DEFAULT_DUTY_ROSTER = [
-  { id: "d1", start: 8,  end: 12, workers: 2 },
-  { id: "d2", start: 12, end: 14, workers: 1 },
-  { id: "d3", start: 14, end: 18, workers: 2 },
+const DUTY_NAME_POOL = [
+  "小李", "小高", "小吴", "小明", "小红", "小芳", "小张", "小王", "小陈", "小刘", "小赵", "小周",
 ];
 
+function makeDefaultDutyDay() {
+  const pool = [...DUTY_NAME_POOL].sort(() => Math.random() - 0.5);
+  let idx = 0;
+  const take = n => {
+    const names = [];
+    for (let k = 0; k < n; k++) names.push(pool[idx++ % pool.length]);
+    return names;
+  };
+  return [
+    normalizeDutySeg({ id: uid(), start: 8,  end: 12, names: take(2) }),
+    normalizeDutySeg({ id: uid(), start: 12, end: 14, names: take(1) }),
+    normalizeDutySeg({ id: uid(), start: 14, end: 18, names: take(2) }),
+  ];
+}
+
+function segDutyCount(seg) {
+  if (Array.isArray(seg?.names) && seg.names.length) return seg.names.length;
+  return seg?.workers ?? 0;
+}
+
+function normalizeDutySeg(seg) {
+  let names = Array.isArray(seg?.names) ? seg.names.map(n => String(n).trim()).filter(Boolean) : [];
+  if (!names.length && (seg?.workers ?? 0) > 0) {
+    for (let i = 0; i < seg.workers; i++) names.push(`人员${i + 1}`);
+  }
+  return { ...seg, names, workers: names.length };
+}
+
 function cloneDutyRoster(roster) {
-  return (roster || []).map(seg => ({ ...seg, id: uid() }));
+  return (roster || []).map(seg => normalizeDutySeg({ ...seg, id: uid(), names: [...(seg.names || [])] }));
 }
 
 function makeDefaultDutyWeek() {
-  return Array.from({ length: 5 }, () => cloneDutyRoster(DEFAULT_DUTY_ROSTER));
+  return Array.from({ length: 5 }, () => makeDefaultDutyDay());
 }
 
 const DEFAULT_CST = {
@@ -92,8 +118,10 @@ function getDutyRosterForDay(cst, dayIdx) {
 function normalizeCst(cst) {
   const base = { ...DEFAULT_CST, ...cst };
   if (base.dutyRosterByDay?.length) {
-    const week = [...base.dutyRosterByDay];
-    while (week.length < 5) week.push(cloneDutyRoster(DEFAULT_DUTY_ROSTER));
+    const week = [...base.dutyRosterByDay].map(day =>
+      (day || []).map(seg => normalizeDutySeg(seg))
+    );
+    while (week.length < 5) week.push(makeDefaultDutyDay());
     return { ...base, dutyRosterByDay: week.slice(0, 5) };
   }
   if (cst?.dutyRoster?.length) {
@@ -103,8 +131,11 @@ function normalizeCst(cst) {
   const shiftStart = cst?.shiftStart ?? DEFAULT_CST.shiftStart;
   const shiftEnd = cst?.shiftEnd ?? DEFAULT_CST.shiftEnd;
   const workers = cst?.totalWorkers ?? 2;
-  const single = [{ id: uid(), start: shiftStart, end: shiftEnd, workers }];
-  return { ...base, dutyRosterByDay: Array.from({ length: 5 }, () => cloneDutyRoster(single)) };
+  const single = normalizeDutySeg({
+    id: uid(), start: shiftStart, end: shiftEnd,
+    names: Array.from({ length: workers }, (_, i) => `人员${i + 1}`),
+  });
+  return { ...base, dutyRosterByDay: Array.from({ length: 5 }, () => cloneDutyRoster([single])) };
 }
 
 function validateDutyRosterForDay(cst, roster, dayLabel) {
@@ -123,7 +154,7 @@ function validateDutyRosterForDay(cst, roster, dayLabel) {
     }
     if (seg.start < cursor) errors.push(`${prefix}时段 ${seg.start}:00–${seg.end}:00 与上一时段重叠`);
     cursor = Math.max(cursor, seg.end);
-    if (seg.workers < 1) errors.push(`${prefix}时段 ${seg.start}:00–${seg.end}:00 在岗人数至少为 1`);
+    if (segDutyCount(seg) < 1) errors.push(`${prefix}时段 ${seg.start}:00–${seg.end}:00 至少添加 1 名值班人员`);
   }
   return errors;
 }
@@ -152,7 +183,10 @@ function getDutyRosterGapsForDay(cst, roster) {
 function formatDutyRosterSummary(roster) {
   return [...(roster || [])]
     .sort((a, b) => a.start - b.start)
-    .map(seg => `${String(seg.start).padStart(2, "0")}–${String(seg.end).padStart(2, "0")} · ${seg.workers}人`)
+    .map(seg => {
+      const names = (seg.names || []).join("、") || "未填";
+      return `${String(seg.start).padStart(2, "0")}–${String(seg.end).padStart(2, "0")} · ${names}（${segDutyCount(seg)}人）`;
+    })
     .join(" | ");
 }
 
@@ -201,7 +235,7 @@ function getDutyCapacityAt(t, cst) {
   const dayIdx = Math.floor(t / 24);
   const hour = t % 24;
   for (const seg of getDutyRosterForDay(cst, dayIdx)) {
-    if (hour >= seg.start && hour < seg.end) return seg.workers;
+    if (hour >= seg.start && hour < seg.end) return segDutyCount(seg);
   }
   return 0;
 }
@@ -623,6 +657,43 @@ const NumInput = ({value,onChange,min=0,max=99,step=0.5,unit="",style={}}) => (
     {unit&&<span style={{fontSize:11,color:C.t3}}>{unit}</span>}
   </div>
 );
+
+const DutyNameEditor = ({ names = [], onChange, max = 20 }) => {
+  const [draft, setDraft] = useState("");
+  const addName = () => {
+    const n = draft.trim();
+    if (!n || names.includes(n) || names.length >= max) return;
+    onChange([...names, n]);
+    setDraft("");
+  };
+  return (
+    <div style={{minWidth:160}}>
+      <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:names.length?6:0}}>
+        {names.map((name, i) => (
+          <span key={`${name}-${i}`} style={{display:"inline-flex",alignItems:"center",gap:4,
+            padding:"3px 8px",borderRadius:6,background:C.accentBg,
+            border:`1px solid ${C.accentBdr}`,fontSize:11,color:C.accent,fontWeight:600}}>
+            {name}
+            <button type="button" onClick={()=>onChange(names.filter((_, j) => j !== i))}
+              style={{border:"none",background:"transparent",color:C.danger,cursor:"pointer",
+                fontSize:12,lineHeight:1,padding:0}}>×</button>
+          </span>
+        ))}
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:4}}>
+        <input value={draft} placeholder="输入姓名"
+          onChange={e=>setDraft(e.target.value)}
+          onKeyDown={e=>{ if (e.key==="Enter") { e.preventDefault(); addName(); } }}
+          style={{flex:1,minWidth:72,padding:"4px 8px",borderRadius:5,
+            border:`1px solid ${C.border2}`,fontSize:11,outline:"none"}}/>
+        <button type="button" onClick={addName} disabled={!draft.trim() || names.length >= max}
+          style={{padding:"4px 8px",borderRadius:5,border:`1px solid ${C.border2}`,
+            background:C.surface,cursor:"pointer",fontSize:11,color:C.accent,fontWeight:600}}>＋</button>
+        <span style={{fontSize:10,color:C.t3,whiteSpace:"nowrap"}}>共{names.length}人</span>
+      </div>
+    </div>
+  );
+};
 
 const Stepper = ({value,onChange,min=1,max=10,color=C.t0}) => (
   <div style={{display:"flex",alignItems:"center",gap:4}}>
@@ -1371,7 +1442,25 @@ export default function App() {
       const nc = normalizeCst(p);
       const week = nc.dutyRosterByDay.map((roster, i) =>
         i === dayIdx
-          ? roster.map(seg => seg.id === id ? { ...seg, [k]: v } : seg)
+          ? roster.map(seg => {
+              if (seg.id !== id) return seg;
+              const next = normalizeDutySeg({ ...seg, [k]: v });
+              return next;
+            })
+          : roster
+      );
+      return { ...nc, dutyRosterByDay: week };
+    });
+    setEvents([]);
+  };
+  const updDutyNames = (dayIdx, id, names) => {
+    setCst(p => {
+      const nc = normalizeCst(p);
+      const week = nc.dutyRosterByDay.map((roster, i) =>
+        i === dayIdx
+          ? roster.map(seg => seg.id === id
+            ? normalizeDutySeg({ ...seg, names })
+            : seg)
           : roster
       );
       return { ...nc, dutyRosterByDay: week };
@@ -1387,7 +1476,7 @@ export default function App() {
         const lastEnd = sorted.length ? sorted[sorted.length - 1].end : nc.shiftStart;
         const start = Math.min(lastEnd, nc.shiftEnd - 1);
         const end = Math.min(start + 2, nc.shiftEnd);
-        return [...sorted, { id: uid(), start, end, workers: 1 }];
+        return [...sorted, { id: uid(), start, end, names: [], workers: 0 }];
       });
       return { ...nc, dutyRosterByDay: week };
     });
@@ -1787,7 +1876,7 @@ export default function App() {
                   </div>
                 </div>
                 <div style={{fontSize:11,color:C.t3,marginBottom:10}}>
-                  周一至周五分别配置在岗人数；空档时段不可排产（作为约束，不阻止生成）
+                  周一至周五分别配置值班人员（填写姓名，一人一格）；人数按姓名自动统计；空档不可排产
                 </div>
                 <div style={{display:"flex",gap:4,marginBottom:12,flexWrap:"wrap"}}>
                   {Array.from({ length: normCst.workDays }, (_, d) => (
@@ -1803,7 +1892,7 @@ export default function App() {
                 <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
                   <thead>
                     <tr style={{borderBottom:`1px solid ${C.border}`}}>
-                      {["开始","结束","在岗人数",""].map(h=>(
+                      {["开始","结束","值班人员",""].map(h=>(
                         <th key={h} style={{padding:"6px 8px",textAlign:"left",
                           fontSize:10,color:C.t3,fontWeight:700}}>{h}</th>
                       ))}
@@ -1820,10 +1909,11 @@ export default function App() {
                           <NumInput value={seg.end} min={1} max={24} step={1} unit="时"
                             onChange={v=>updDutySeg(dutyDayTab, seg.id,"end",v)}/>
                         </td>
-                        <td style={{padding:"7px 8px"}}>
-                          <Stepper value={seg.workers}
-                            onChange={v=>updDutySeg(dutyDayTab, seg.id,"workers",v)}
-                            min={1} max={20} color={C.t1}/>
+                        <td style={{padding:"7px 8px",verticalAlign:"top"}}>
+                          <DutyNameEditor
+                            names={seg.names || []}
+                            onChange={names=>updDutyNames(dutyDayTab, seg.id, names)}
+                            max={20}/>
                         </td>
                         <td style={{padding:"7px 8px",textAlign:"right"}}>
                           <button onClick={()=>delDutySeg(dutyDayTab, seg.id)}
