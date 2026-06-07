@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect } from "react";
+import { apiUrl } from "./apiBase";
 // import { AgentWidget } from "./components/agent";  // 智能客服：汇报前暂不展示，取消注释即可启用
 
 // ══════════════════════════════════════════════════════════════════
@@ -106,7 +107,69 @@ const DEFAULT_CST = {
   shiftEnd          : 18,
   workDays          : 5,
   dutyRosterByDay   : makeDefaultDutyWeek(),
+  eqCount           : Object.fromEntries(EQ_ORDER.map(eq => [eq, 1])),
 };
+
+function defaultEqCount() {
+  return Object.fromEntries(EQ_ORDER.map(eq => [eq, 1]));
+}
+
+function normalizeEqCount(eqCount) {
+  const base = defaultEqCount();
+  if (!eqCount || typeof eqCount !== "object") return base;
+  for (const eq of EQ_ORDER) {
+    base[eq] = Math.max(1, Math.min(10, Math.floor(Number(eqCount[eq]) || 1)));
+  }
+  return base;
+}
+
+/** 展开设备实例：单台保持原名，多台为 搅拌机1、搅拌机2 … */
+function getEqInstances(cst) {
+  const counts = normalizeEqCount(normalizeCst(cst).eqCount);
+  const list = [];
+  for (const eq of EQ_ORDER) {
+    const n = counts[eq];
+    if (n <= 1) list.push(eq);
+    else for (let i = 1; i <= n; i++) list.push(`${eq}${i}`);
+  }
+  return list;
+}
+
+function eqTypeOf(instance) {
+  if (EQ_ORDER.includes(instance)) return instance;
+  for (const eq of EQ_ORDER) {
+    if (instance.startsWith(eq)) {
+      const suffix = instance.slice(eq.length);
+      if (/^\d+$/.test(suffix)) return eq;
+    }
+  }
+  return instance;
+}
+
+function instancesForType(cst, eqType) {
+  return getEqInstances(cst).filter(inst => eqTypeOf(inst) === eqType);
+}
+
+function initEqTimelines(cst, frozenEvents = []) {
+  const tls = Object.fromEntries(getEqInstances(cst).map(inst => [inst, []]));
+  for (const e of frozenEvents) {
+    const inst = e.eq;
+    if (!tls[inst]) tls[inst] = [];
+    tls[inst].push({ start: e.start, end: e.end });
+  }
+  for (const inst of Object.keys(tls)) tls[inst].sort((a, b) => a.start - b.start);
+  return tls;
+}
+
+function formatEqCountSummary(cst) {
+  const counts = normalizeEqCount(normalizeCst(cst).eqCount);
+  return EQ_ORDER.map(eq => {
+    const n = counts[eq];
+    if (n <= 1) return `${eq}×1`;
+    const names = Array.from({ length: n }, (_, i) => `${eq}${i + 1}`).join("、");
+    return `${eq}×${n}（${names}）`;
+  }).join(" · ");
+}
 
 function getDutyRosterForDay(cst, dayIdx) {
   const week = cst.dutyRosterByDay;
@@ -116,7 +179,7 @@ function getDutyRosterForDay(cst, dayIdx) {
 }
 
 function normalizeCst(cst) {
-  const base = { ...DEFAULT_CST, ...cst };
+  const base = { ...DEFAULT_CST, ...cst, eqCount: normalizeEqCount(cst?.eqCount ?? DEFAULT_CST.eqCount) };
   if (base.dutyRosterByDay?.length) {
     const week = [...base.dutyRosterByDay].map(day =>
       (day || []).map(seg => normalizeDutySeg(seg))
@@ -332,6 +395,21 @@ function findSlot(eq, tl, minStart, dur, cst, workerTl, workers, failures) {
   return Infinity;
 }
 
+/** 在同类型多台设备中选最早可行槽 */
+function findBestSlot(eqType, tls, minStart, dur, cst, workerTl, workers, failures) {
+  const instances = instancesForType(cst, eqType);
+  let bestStart = Infinity;
+  let bestEq = instances[0] || eqType;
+  for (const inst of instances) {
+    const start = findSlot(inst, tls[inst], minStart, dur, cst, workerTl, workers, failures);
+    if (start < bestStart) {
+      bestStart = start;
+      bestEq = inst;
+    }
+  }
+  return { start: bestStart, eq: bestEq };
+}
+
 /**
  * 主排产函数(支持动态重调度)
  * @param {Array}  plan       任务列表 [{id,typeId,batches,priority,note}]
@@ -353,16 +431,13 @@ function runSchedule(plan, types, cst, opts = {}) {
     batchProgress = {},   // { "ptId|wo": startOpIdx }
   } = opts;
 
-  const tls  = {};
+  const tls = initEqTimelines(cst, frozenEvents);
   const workerTl = [];
 
-  // 用冻结工序初始化时间线
+  // 用冻结工序初始化人员时间线
   for (const e of frozenEvents) {
-    if (!tls[e.eq]) tls[e.eq] = [];
-    tls[e.eq].push({ start: e.start, end: e.end });
     if (e.workers > 0) workerTl.push({ start: e.start, end: e.end, workers: e.workers });
   }
-  for (const eq in tls) tls[eq].sort((a,b)=>a.start-b.start);
 
   // 展开 plan → batches
   const batches = [];
@@ -400,7 +475,7 @@ function runSchedule(plan, types, cst, opts = {}) {
 
       let minS = Math.max(prevEnd, minStart);
 
-      const start = findSlot(op.eq, tls[op.eq], minS, totalDur, cst, workerTl, op.workers, failures);
+      const { start, eq: eqInst } = findBestSlot(op.eq, tls, minS, totalDur, cst, workerTl, op.workers, failures);
       const end   = start + totalDur;
 
       const extras = [op.cleanDur > 0 && `清洗${op.cleanDur}h`, op.agv > 0 && `AGV${op.agv}h`].filter(Boolean);
@@ -414,15 +489,15 @@ function runSchedule(plan, types, cst, opts = {}) {
         ptId: batch.pt.id, ptCode: batch.pt.code, ptColor: batch.pt.color,
         opName: opLabel,
         opIdx: i,
-        eq: op.eq, start, end, dur: totalDur, workers: op.workers,
+        eq: eqInst, start, end, dur: totalDur, workers: op.workers,
         isCleaning: false,
         note: batch.task.note,
         isNew: true,        // 标记为重排产生(便于UI区分)
       });
 
-      if (!tls[op.eq]) tls[op.eq] = [];
-      tls[op.eq].push({ start, end });
-      tls[op.eq].sort((a, b) => a.start - b.start);
+      if (!tls[eqInst]) tls[eqInst] = [];
+      tls[eqInst].push({ start, end });
+      tls[eqInst].sort((a, b) => a.start - b.start);
       if (op.workers > 0) workerTl.push({ start, end, workers: op.workers });
 
       prevEnd = end;
@@ -590,6 +665,145 @@ function fmtDur(h) {
   return mins ? `${hrs}h${mins}m` : `${hrs}h`;
 }
 
+/** HGNN+PPO 调优后默认参数 */
+const DEFAULT_HGNN_PARAMS = {
+  episodes: 300,
+  lr: 0.0005,
+  gamma: 0.99,
+  epsClip: 0.2,
+  entropyCoef: 0.02,
+  d: 64,
+};
+
+function buildHgnnRequestBody(plan, types, cst, hgnnParams) {
+  const hp = { ...DEFAULT_HGNN_PARAMS, ...hgnnParams };
+  return {
+    plan, types, cst,
+    episodes: hp.episodes,
+    hgnn: {
+      episodes: hp.episodes,
+      lr: hp.lr,
+      gamma: hp.gamma,
+      eps_clip: hp.epsClip,
+      entropy_coef: hp.entropyCoef,
+      d: hp.d,
+    },
+  };
+}
+
+/** 排产方案 KPI（用于算法对比） */
+function computeScheduleMetrics(events, cst) {
+  const nc = normalizeCst(cst);
+  if (!events?.length) {
+    return { makespan: 0, avgEqUtil: 0, capacityUtil: 0, totalLaborH: 0, totalCleanH: 0, opCount: 0, batchCount: 0 };
+  }
+  const makespan = events.reduce((mx, e) => Math.max(mx, e.end), 0);
+  const instances = getEqInstances(nc);
+  const shiftLen = nc.shiftEnd - nc.shiftStart;
+  const calendarCap = instances.length * nc.workDays * shiftLen;
+  let totalBusy = 0;
+  const utils = instances.map(inst => {
+    const busy = events.filter(e => e.eq === inst && !e.isCleaning).reduce((s, e) => s + e.dur, 0);
+    totalBusy += busy;
+    return makespan ? Math.round(busy / makespan * 100) : 0;
+  }).filter((_, i) => events.some(e => e.eq === instances[i]));
+  const avgEqUtil = utils.length ? Math.round(utils.reduce((a, b) => a + b, 0) / utils.length) : 0;
+  const capacityUtil = calendarCap ? Math.round(totalBusy / calendarCap * 100) : 0;
+  const totalLaborH = events.reduce((s, e) => s + e.dur * (e.workers || 0), 0);
+  const totalCleanH = events.reduce((s, e) => {
+    const m = String(e.opName || "").match(/清洗([\d.]+)h/);
+    return s + (m ? parseFloat(m[1]) : 0);
+  }, 0);
+  return {
+    makespan,
+    avgEqUtil,
+    capacityUtil,
+    totalLaborH: Math.round(totalLaborH * 10) / 10,
+    totalCleanH: Math.round(totalCleanH * 10) / 10,
+    opCount: events.filter(e => !e.isCleaning).length,
+    batchCount: new Set(events.map(e => e.wo)).size,
+  };
+}
+
+function AlgoComparePanel({ compare, onAdopt, loading }) {
+  if (!compare && !loading) return null;
+  const rows = [
+    { key: "makespan", label: "完工时长", fmt: v => fmtTime(v), better: "lower" },
+    { key: "avgEqUtil", label: "设备平均利用率", fmt: v => `${v}%`, better: "higher" },
+    { key: "capacityUtil", label: "产能利用率", fmt: v => `${v}%`, better: "higher" },
+    { key: "totalCleanH", label: "清洗总时长", fmt: v => `${v}h`, better: "lower" },
+    { key: "totalLaborH", label: "人工占用总时", fmt: v => `${v}h`, better: "lower" },
+    { key: "opCount", label: "工序总数", fmt: v => `${v}道`, better: null },
+  ];
+  const pickBest = (key, better) => {
+    if (!compare || !better) return null;
+    const g = compare.greedy.metrics[key];
+    const h = compare.hgnn.metrics[key];
+    if (g === h) return null;
+    return better === "lower" ? (g < h ? "greedy" : "hgnn") : (g > h ? "greedy" : "hgnn");
+  };
+
+  return (
+    <Card style={{ padding: 14, marginBottom: 12, border: `1px solid ${C.accentBdr}`, background: "#f8fafc" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+        <SecHead icon="⚖️" style={{ margin: 0 }}>算法对比报表</SecHead>
+        {compare && (
+          <div style={{ display: "flex", gap: 6 }}>
+            <Btn onClick={() => onAdopt("greedy")}>采用启发式</Btn>
+            <Btn onClick={() => onAdopt("hgnn-ppo")} style={{ background: "#7c3aed", color: "#fff", borderColor: "#7c3aed" }}>
+              采用 HGNN+PPO
+            </Btn>
+          </div>
+        )}
+      </div>
+      {loading && (
+        <div style={{ fontSize: 12, color: C.accent, padding: "8px 0" }}>⏳ 双算法求解中（启发式 + HGNN+PPO）…</div>
+      )}
+      {compare && (
+        <>
+          <div style={{ fontSize: 11, color: C.t3, marginBottom: 10 }}>
+            同一计划 · HGNN episodes={compare.hgnnParams?.episodes ?? 300}
+            {compare.hgnnParams?.lr != null && ` · lr=${compare.hgnnParams.lr}`}
+          </div>
+          <div style={{ overflowX: "auto", borderRadius: 8, border: `1px solid ${C.border}` }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 480 }}>
+              <thead>
+                <tr style={{ background: "#f1f5f9" }}>
+                  {["指标", "启发式算法", "HGNN+PPO"].map(h => (
+                    <th key={h} style={{ padding: "8px 12px", textAlign: "left", fontSize: 10, color: C.t3, fontWeight: 700 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(({ key, label, fmt, better }) => {
+                  const best = pickBest(key, better);
+                  const cell = (side, val) => ({
+                    padding: "8px 12px",
+                    fontFamily: "monospace",
+                    fontWeight: best === side ? 800 : 500,
+                    color: best === side ? C.dn : C.t1,
+                    background: best === side ? C.dnBg : C.surface,
+                  });
+                  return (
+                    <tr key={key} style={{ borderTop: `1px solid ${C.border}` }}>
+                      <td style={{ padding: "8px 12px", color: C.t2, fontWeight: 600 }}>{label}</td>
+                      <td style={cell("greedy", compare.greedy.metrics[key])}>{fmt(compare.greedy.metrics[key])}</td>
+                      <td style={cell("hgnn", compare.hgnn.metrics[key])}>{fmt(compare.hgnn.metrics[key])}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ fontSize: 10, color: C.t3, marginTop: 8 }}>
+            绿色高亮为该项较优 · 产能利用率 = 设备忙碌总时 /（设备台数 × 工作日 × 日班次时长）
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
 // "周X HH:MM" 字符串 → 绝对小时
 function parseTimeStr(s) {
   // 接受 "周一 09:30" 或 "1 09:30" 形式
@@ -733,8 +947,12 @@ function GanttChart({events, cst, rescheduleAt, failures}) {
     return day * shiftLen + dh;
   };
 
-  const activeEqs = EQ_ORDER.filter(eq => events.some(e=>e.eq===eq) || (failures||[]).some(f=>f.eq===eq));
-  const PX=44, ROW=42, LBL=82, HDR=46, PAD=12;
+  const activeEqs = events.length > 0
+    ? getEqInstances(cst)
+    : getEqInstances(cst).filter(inst =>
+        events.some(e => e.eq === inst) || (failures || []).some(f => f.eq === inst)
+      );
+  const PX=44, ROW=42, LBL=96, HDR=46, PAD=12;
   const W = LBL + totalDays*shiftLen*PX + PAD;
   const H = HDR + activeEqs.length*ROW + 4;
 
@@ -975,7 +1193,7 @@ function RescheduleModal({open, onClose, onConfirm, types, currentEvents, curren
   }
 
   const addFailure = () => {
-    setFailures(p=>[...p, {id:uid(), eq:EQ_ORDER[2], startStr:fmtTime(rescheduleAt||0), endStr:fmtTime((rescheduleAt||0)+4), reason:"设备故障"}]);
+    setFailures(p=>[...p, {id:uid(), eq:getEqInstances(cst)[2]||"混合锅", startStr:fmtTime(rescheduleAt||0), endStr:fmtTime((rescheduleAt||0)+4), reason:"设备故障"}]);
   };
   const updFailure = (id,k,v) => setFailures(p=>p.map(f=>f.id===id?{...f,[k]:v}:f));
   const delFailure = id => setFailures(p=>p.filter(f=>f.id!==id));
@@ -1073,7 +1291,7 @@ function RescheduleModal({open, onClose, onConfirm, types, currentEvents, curren
                 <select value={f.eq} onChange={e=>updFailure(f.id,"eq",e.target.value)}
                   style={{padding:"3px 6px",borderRadius:5,border:`1px solid ${C.border2}`,
                     fontSize:11,outline:"none"}}>
-                  {EQ_ORDER.map(eq=><option key={eq} value={eq}>{eq}</option>)}
+                  {getEqInstances(cst).map(eq=><option key={eq} value={eq}>{eq}</option>)}
                 </select>
                 <span style={{fontSize:10,color:C.t2}}>从</span>
                 <input value={f.startStr}
@@ -1192,6 +1410,10 @@ export default function App() {
   const [view,   setView]   = useState("gantt");
   const [algo,   setAlgo]   = useState("greedy");
   const [loading, setLoading] = useState(false);
+  const [compareLoading, setCompareLoading] = useState(false);
+  const [algoCompare, setAlgoCompare] = useState(null);
+  const [hgnnParams, setHgnnParams] = useState({ ...DEFAULT_HGNN_PARAMS });
+  const [hgnnAdvancedOpen, setHgnnAdvancedOpen] = useState(false);
   const [openType, setOpenType] = useState({pt1:true});
   const [dutyDayTab, setDutyDayTab] = useState(0);
 
@@ -1203,7 +1425,7 @@ export default function App() {
 
   const typeMap = useMemo(()=>Object.fromEntries(types.map(t=>[t.id,t])),[types]);
 
-  const generate = async () => {
+  const validateBeforeSchedule = () => {
     let needA = 0, needB = 0, needR = 0;
     for (const task of plan) {
       const pt = typeMap[task.typeId];
@@ -1220,19 +1442,36 @@ export default function App() {
     if (needR > cst.stockRelease) shortage.push(`脱模剂（需${needR}，库存${cst.stockRelease}）`);
     if (shortage.length) {
       alert("物料不足！\n" + shortage.join("\n"));
-      return;
+      return false;
     }
-
     const dutyErrors = validateDutyRoster(normalizeCst(cst));
     if (dutyErrors.length) {
       alert("值班表配置有误，请补全后再排产：\n" + dutyErrors.join("\n"));
       setTab("cst");
-      return;
+      return false;
     }
+    return true;
+  };
+
+  const fetchHgnnSchedule = async (body) => {
+    const resp = await fetch(apiUrl("/api/schedule/hgnn-ppo"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) throw new Error(`服务端错误: ${resp.status}`);
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    return data;
+  };
+
+  const generate = async () => {
+    if (!validateBeforeSchedule()) return;
 
     if (algo === "greedy") {
       const result = runSchedule(plan, types, cst);
       setEvents(result);
+      setAlgoCompare(null);
       setRescheduleAt(null);
       setFailures([]);
       setReschedHistory([]);
@@ -1241,15 +1480,9 @@ export default function App() {
     } else {
       setLoading(true);
       try {
-        const resp = await fetch("/api/schedule/hgnn-ppo", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ plan, types, cst, episodes: 300 }),
-        });
-        if (!resp.ok) throw new Error(`服务端错误: ${resp.status}`);
-        const data = await resp.json();
-        if (data.error) { alert("HGNN+PPO 求解失败: " + data.error); return; }
+        const data = await fetchHgnnSchedule(buildHgnnRequestBody(plan, types, cst, hgnnParams));
         setEvents(data.events || []);
+        setAlgoCompare(null);
         setRescheduleAt(null);
         setFailures([]);
         setReschedHistory([]);
@@ -1261,6 +1494,45 @@ export default function App() {
         setLoading(false);
       }
     }
+  };
+
+  const runAlgoCompare = async () => {
+    if (!validateBeforeSchedule()) return;
+    setCompareLoading(true);
+    setAlgoCompare(null);
+    setTab("result");
+    try {
+      const greedyEvents = runSchedule(plan, types, cst);
+      const body = buildHgnnRequestBody(plan, types, cst, hgnnParams);
+      const data = await fetchHgnnSchedule(body);
+      const hgnnEvents = data.events || [];
+      setAlgoCompare({
+        greedy: { events: greedyEvents, metrics: computeScheduleMetrics(greedyEvents, cst) },
+        hgnn: { events: hgnnEvents, metrics: computeScheduleMetrics(hgnnEvents, cst) },
+        hgnnParams: data.hgnnParams || body.hgnn,
+      });
+    } catch (e) {
+      alert("算法对比失败：\n" + e.message);
+    } finally {
+      setCompareLoading(false);
+    }
+  };
+
+  const adoptCompareResult = (which) => {
+    if (!algoCompare) return;
+    const picked = which === "greedy" ? algoCompare.greedy : algoCompare.hgnn;
+    setEvents(picked.events);
+    setAlgo(which);
+    setRescheduleAt(null);
+    setFailures([]);
+    setReschedHistory([]);
+    setView("gantt");
+  };
+
+  const updHgnnParam = (key, val) => {
+    setHgnnParams(p => ({ ...p, [key]: val }));
+    setEvents([]);
+    setAlgoCompare(null);
   };
 
   // ── 重调度执行 ─────────────────────────────────────────────────
@@ -1287,17 +1559,14 @@ export default function App() {
     if (algo === "hgnn-ppo") {
       setLoading(true);
       try {
-        const resp = await fetch("/api/schedule/hgnn-ppo/reschedule", {
+        const resp = await fetch(apiUrl("/api/schedule/hgnn-ppo/reschedule"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            plan: planWithNew,
-            types,
-            cst,
+            ...buildHgnnRequestBody(planWithNew, types, cst, hgnnParams),
             currentEvents: events,
             rescheduleAt: t,
             failures: allFailures,
-            episodes: 300,
           }),
         });
         if (!resp.ok) throw new Error(`服务端错误: ${resp.status}`);
@@ -1329,20 +1598,21 @@ export default function App() {
   const opCount    = useMemo(()=>events.filter(e=>!e.isCleaning).length,[events]);
   const eqUtil     = useMemo(()=>{
     if (!makespan) return {};
-    return Object.fromEntries(EQ_ORDER.map(eq=>{
-      const busy = events.filter(e=>e.eq===eq&&!e.isCleaning)
+    const instances = getEqInstances(cst);
+    return Object.fromEntries(instances.map(inst=>{
+      const busy = events.filter(e=>e.eq===inst&&!e.isCleaning)
         .reduce((s,e)=>s+e.dur,0);
-      return [eq, Math.round(busy/makespan*100)];
+      return [inst, Math.round(busy/makespan*100)];
     }));
-  },[events,makespan]);
+  },[events,makespan,cst]);
 
   const planBatches  = plan.reduce((s,t)=>s+t.batches,0);
 
   // ── 导出 PDF ──────────────────────────────────────────────────
   const exportPDF = () => {
-    const algoLabel = algo === "greedy" ? "贪心算法" : "HGNN+PPO 智能调度";
-    const utilItems = EQ_ORDER.filter(eq => events.some(e => e.eq === eq))
-      .map(eq => `<span>${eq}: <b>${eqUtil[eq] || 0}%</b></span>`).join("  ");
+    const algoLabel = algo === "greedy" ? "启发式算法" : "HGNN+PPO 智能调度";
+    const utilItems = getEqInstances(cst).filter(inst => events.some(e => e.eq === inst))
+      .map(inst => `<span>${inst}: <b>${eqUtil[inst] || 0}%</b></span>`).join("  ");
 
     const rows = events.map((e, i) =>
       `<tr style="background:${i % 2 === 0 ? '#fff' : '#f8fafc'}">
@@ -1436,7 +1706,15 @@ export default function App() {
   };
   const delTask  = id => { setPlan(p=>p.filter(t=>t.id!==id)); setEvents([]); };
   const updTask  = (id,k,v) => { setPlan(p=>p.map(t=>t.id===id?{...t,[k]:v}:t)); setEvents([]); };
-  const updCst   = (k,v) => { setCst(p=>normalizeCst({...p,[k]:v})); setEvents([]); };
+  const updCst   = (k,v) => { setCst(p=>normalizeCst({...p,[k]:v})); setEvents([]); setAlgoCompare(null); };
+  const updEqCount = (eqType, n) => {
+    setCst(p => {
+      const nc = normalizeCst(p);
+      return normalizeCst({ ...nc, eqCount: { ...normalizeEqCount(nc.eqCount), [eqType]: n } });
+    });
+    setEvents([]);
+    setAlgoCompare(null);
+  };
   const updDutySeg = (dayIdx, id, k, v) => {
     setCst(p => {
       const nc = normalizeCst(p);
@@ -1562,10 +1840,13 @@ export default function App() {
               style={{padding:"5px 8px",borderRadius:6,border:`1px solid ${C.border2}`,
                 fontSize:11,fontWeight:600,color:C.t1,background:C.surface,cursor:"pointer",
                 outline:"none"}}>
-              <option value="greedy">贪心算法</option>
+              <option value="greedy">启发式算法</option>
               <option value="hgnn-ppo">HGNN+PPO 智能调度</option>
             </select>
-            <Btn primary onClick={generate} disabled={loading}>
+            <Btn onClick={runAlgoCompare} disabled={loading || compareLoading}>
+              {compareLoading ? "⏳ 对比中…" : "⚖ 算法对比"}
+            </Btn>
+            <Btn primary onClick={generate} disabled={loading || compareLoading}>
               {loading ? "⏳ 求解中..." : "▶ 生成排产"}
             </Btn>
           </div>
@@ -1844,78 +2125,181 @@ export default function App() {
 
         {/* ══════ 约束参数 ══════ */}
         {tab==="cst"&&(
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{fontSize:13,color:C.t2,lineHeight:1.6}}>
+              配置物料库存、班次与设备产能、值班人员；生成排产前请确认值班表无红色错误提示。
+            </div>
+
+            {/* 基础约束：单卡片统一排版 */}
             <Card style={{padding:16}}>
-              <SecHead icon="⏱">工艺约束</SecHead>
-
-              {[
-                ["stockMatA",     "原料A库存",      "当前原料A的可用库存量",       0, 9999, 1, ""],
-                ["stockMatB",     "原料B库存",      "当前原料B的可用库存量",       0, 9999, 1, ""],
-                ["stockRelease",  "脱模剂库存",     "当前脱模剂的可用库存量",       0, 9999, 0.1, ""],
-              ].map(([key,label,desc,min,max,step,unit])=>(
-                <div key={key} style={{marginBottom:14,padding:"11px 14px",borderRadius:8,
-                  border:`1px solid ${C.border}`,background:"#f8fafc"}}>
-                  <div style={{display:"flex",justifyContent:"space-between",
-                    alignItems:"center",marginBottom:4}}>
-                    <span style={{fontSize:13,fontWeight:600,color:C.t0}}>{label}</span>
-                    <NumInput value={cst[key]} min={min} max={max} step={step} unit={unit}
-                      onChange={v=>updCst(key,Math.max(min,v))}/>
+              <SecHead icon="⚙️">基础约束</SecHead>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20,marginBottom:16}}>
+                <div>
+                  <div style={{fontSize:11,fontWeight:700,color:C.t3,textTransform:"uppercase",
+                    letterSpacing:"0.04em",marginBottom:10}}>📦 物料库存</div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+                    {[
+                      ["stockMatA",    "原料 A",  0, 9999, 1,   ""],
+                      ["stockMatB",    "原料 B",  0, 9999, 1,   ""],
+                      ["stockRelease", "脱模剂",  0, 9999, 0.1, ""],
+                    ].map(([key,label,min,max,step,unit])=>(
+                      <label key={key} style={{display:"block",padding:"10px 8px",borderRadius:8,
+                        border:`1px solid ${C.border}`,background:"#f8fafc",cursor:"default"}}>
+                        <div style={{fontSize:11,color:C.t2,marginBottom:8,textAlign:"center"}}>{label}</div>
+                        <div style={{display:"flex",justifyContent:"center"}}>
+                          <NumInput value={cst[key]} min={min} max={max} step={step} unit={unit}
+                            onChange={v=>updCst(key,Math.max(min,v))}/>
+                        </div>
+                      </label>
+                    ))}
                   </div>
-                  <div style={{fontSize:11,color:C.t3}}>{desc}</div>
                 </div>
-              ))}
+                <div>
+                  <div style={{fontSize:11,fontWeight:700,color:C.t3,textTransform:"uppercase",
+                    letterSpacing:"0.04em",marginBottom:10}}>🕐 班次与周期</div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+                    {[
+                      ["shiftStart", "开始", "时", 0, 23, 1],
+                      ["shiftEnd",   "结束", "时", 1, 24, 1],
+                      ["workDays",   "天数", "天", 1, 14, 1],
+                    ].map(([key,label,unit,min,max,step])=>(
+                      <label key={key} style={{display:"block",padding:"10px 8px",borderRadius:8,
+                        border:`1px solid ${C.border}`,background:"#f8fafc",cursor:"default"}}>
+                        <div style={{fontSize:11,color:C.t2,marginBottom:8,textAlign:"center"}}>{label}</div>
+                        <div style={{display:"flex",justifyContent:"center"}}>
+                          <NumInput value={cst[key]} min={min} max={max} step={step} unit={unit}
+                            onChange={v=>updCst(key,Math.max(min,v))}/>
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                  <div style={{marginTop:8,fontSize:10,color:C.t3,textAlign:"center"}}>
+                    {String(cst.shiftStart).padStart(2,"0")}:00 — {String(cst.shiftEnd).padStart(2,"0")}:00 · 共 {cst.shiftEnd - cst.shiftStart}h/天
+                  </div>
+                </div>
+              </div>
 
-              <div style={{marginTop:8,padding:"12px 14px",borderRadius:8,
-                border:`1px solid ${C.border}`,background:"#f8fafc"}}>
-                <div style={{display:"flex",justifyContent:"space-between",
-                  alignItems:"center",marginBottom:10}}>
+              <div style={{height:1,background:C.border,margin:"0 0 14px"}}/>
+
+              <div>
+                <div style={{fontSize:11,fontWeight:700,color:C.t3,textTransform:"uppercase",
+                  letterSpacing:"0.04em",marginBottom:10}}>🏭 设备台数</div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8}}>
+                  {EQ_ORDER.map(eq=>{
+                    const n = normalizeEqCount(normCst.eqCount)[eq];
+                    return (
+                      <div key={eq} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8,
+                        padding:"10px 8px",borderRadius:8,background:"#f8fafc",
+                        border:`1px solid ${C.border}`}}>
+                        <span style={{fontSize:12,fontWeight:600,color:C.t1,whiteSpace:"nowrap"}}>{eq}</span>
+                        <Stepper value={n} min={1} max={5} onChange={v=>updEqCount(eq,v)} color={C.accent}/>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </Card>
+
+            {/* HGNN 求解参数 */}
+            <Card style={{ padding: 16 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+                <SecHead icon="🧠" style={{ margin: 0 }}>HGNN+PPO 求解参数</SecHead>
+                <button type="button" onClick={() => setHgnnAdvancedOpen(o => !o)}
+                  style={{ padding: "4px 10px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.surface,
+                    fontSize: 11, color: C.t2, cursor: "pointer" }}>
+                  {hgnnAdvancedOpen ? "收起高级参数 ▲" : "高级参数 ▼"}
+                </button>
+              </div>
+              <div style={{ fontSize: 11, color: C.t3, marginBottom: 12 }}>
+                以下为调优后推荐默认值；仅在选择 HGNN+PPO 或「算法对比」时生效
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: hgnnAdvancedOpen ? "repeat(3,1fr)" : "1fr", gap: 10 }}>
+                <div style={{ padding: "10px 14px", borderRadius: 8, border: `1px solid ${C.accentBdr}`, background: C.accentBg }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: C.accent, marginBottom: 8 }}>训练轮数 episodes（推荐）</div>
+                  <NumInput value={hgnnParams.episodes} min={50} max={2000} step={50} unit="轮"
+                    onChange={v => updHgnnParam("episodes", Math.max(50, v))}/>
+                  <div style={{ fontSize: 10, color: C.t3, marginTop: 6 }}>默认 {DEFAULT_HGNN_PARAMS.episodes} · 越大越慢、结果可能更优</div>
+                </div>
+                {hgnnAdvancedOpen && [
+                  ["lr", "学习率 lr", 0.00001, 0.01, 0.00001, ""],
+                  ["gamma", "折扣因子 γ", 0.9, 0.999, 0.01, ""],
+                  ["epsClip", "PPO clip ε", 0.05, 0.5, 0.05, ""],
+                  ["entropyCoef", "熵系数", 0, 0.1, 0.01, ""],
+                  ["d", "隐层维度 d", 32, 128, 8, ""],
+                ].map(([key, label, min, max, step]) => (
+                  <div key={key} style={{ padding: "10px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: "#f8fafc" }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: C.t2, marginBottom: 8 }}>{label}</div>
+                    <NumInput value={hgnnParams[key]} min={min} max={max} step={step}
+                      onChange={v => updHgnnParam(key, key === "d" ? Math.round(v) : v)}/>
+                    <div style={{ fontSize: 10, color: C.t3, marginTop: 6 }}>默认 {DEFAULT_HGNN_PARAMS[key]}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+                <Btn onClick={() => { setHgnnParams({ ...DEFAULT_HGNN_PARAMS }); setEvents([]); setAlgoCompare(null); }}>
+                  恢复默认
+                </Btn>
+              </div>
+            </Card>
+
+            {/* 值班表：全宽 */}
+            <Card style={{padding:16}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",
+                flexWrap:"wrap",gap:10,marginBottom:12}}>
+                <div>
                   <SecHead icon="👥" style={{margin:0}}>值班表（按工作日）</SecHead>
-                  <div style={{display:"flex",gap:6}}>
-                    <Btn onClick={()=>copyDutyToAllDays(dutyDayTab)}>复制到全周</Btn>
-                    <Btn onClick={()=>addDutySeg(dutyDayTab)}>＋ 添加时段</Btn>
+                  <div style={{fontSize:11,color:C.t3,marginTop:6,maxWidth:520}}>
+                    周一至周五分别配置；填写姓名（一人一格），人数自动统计；空档时段不可排产
                   </div>
                 </div>
-                <div style={{fontSize:11,color:C.t3,marginBottom:10}}>
-                  周一至周五分别配置值班人员（填写姓名，一人一格）；人数按姓名自动统计；空档不可排产
+                <div style={{display:"flex",gap:6,flexShrink:0}}>
+                  <Btn onClick={()=>copyDutyToAllDays(dutyDayTab)}>复制到全周</Btn>
+                  <Btn onClick={()=>addDutySeg(dutyDayTab)}>＋ 添加时段</Btn>
                 </div>
-                <div style={{display:"flex",gap:4,marginBottom:12,flexWrap:"wrap"}}>
-                  {Array.from({ length: normCst.workDays }, (_, d) => (
-                    <button key={d} onClick={()=>setDutyDayTab(d)}
-                      style={{padding:"5px 12px",borderRadius:6,cursor:"pointer",fontSize:12,fontWeight:600,
-                        border:`1px solid ${dutyDayTab===d?C.accent:C.border}`,
-                        background:dutyDayTab===d?C.accentBg:C.surface,
-                        color:dutyDayTab===d?C.accent:C.t2}}>
-                      {DAYS_ZH[d]}
-                    </button>
-                  ))}
-                </div>
-                <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              </div>
+
+              <div style={{display:"flex",gap:4,marginBottom:14,flexWrap:"wrap"}}>
+                {Array.from({ length: normCst.workDays }, (_, d) => (
+                  <button key={d} onClick={()=>setDutyDayTab(d)}
+                    style={{padding:"6px 14px",borderRadius:6,cursor:"pointer",fontSize:12,fontWeight:600,
+                      border:`1px solid ${dutyDayTab===d?C.accent:C.border}`,
+                      background:dutyDayTab===d?C.accentBg:C.surface,
+                      color:dutyDayTab===d?C.accent:C.t2}}>
+                    {DAYS_ZH[d]}
+                  </button>
+                ))}
+              </div>
+
+              <div style={{overflowX:"auto",borderRadius:8,border:`1px solid ${C.border}`}}>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:560}}>
                   <thead>
-                    <tr style={{borderBottom:`1px solid ${C.border}`}}>
+                    <tr style={{background:"#f8fafc"}}>
                       {["开始","结束","值班人员",""].map(h=>(
-                        <th key={h} style={{padding:"6px 8px",textAlign:"left",
-                          fontSize:10,color:C.t3,fontWeight:700}}>{h}</th>
+                        <th key={h} style={{padding:"8px 12px",textAlign:"left",
+                          fontSize:10,color:C.t3,fontWeight:700,
+                          borderBottom:`1px solid ${C.border}`}}>{h}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
                     {[...activeDutyRoster].sort((a,b)=>a.start-b.start).map(seg=>(
-                      <tr key={seg.id} style={{borderBottom:`1px solid ${C.border}`}}>
-                        <td style={{padding:"7px 8px"}}>
+                      <tr key={seg.id} style={{borderBottom:`1px solid ${C.border}`,
+                        background:C.surface}}>
+                        <td style={{padding:"8px 12px",width:100}}>
                           <NumInput value={seg.start} min={0} max={23} step={1} unit="时"
                             onChange={v=>updDutySeg(dutyDayTab, seg.id,"start",v)}/>
                         </td>
-                        <td style={{padding:"7px 8px"}}>
+                        <td style={{padding:"8px 12px",width:100}}>
                           <NumInput value={seg.end} min={1} max={24} step={1} unit="时"
                             onChange={v=>updDutySeg(dutyDayTab, seg.id,"end",v)}/>
                         </td>
-                        <td style={{padding:"7px 8px",verticalAlign:"top"}}>
+                        <td style={{padding:"8px 12px",verticalAlign:"top"}}>
                           <DutyNameEditor
                             names={seg.names || []}
                             onChange={names=>updDutyNames(dutyDayTab, seg.id, names)}
                             max={20}/>
                         </td>
-                        <td style={{padding:"7px 8px",textAlign:"right"}}>
+                        <td style={{padding:"8px 12px",width:44,textAlign:"center"}}>
                           <button onClick={()=>delDutySeg(dutyDayTab, seg.id)}
                             disabled={activeDutyRoster.length<=1}
                             style={{border:"none",background:"transparent",color:C.danger,
@@ -1926,24 +2310,27 @@ export default function App() {
                     ))}
                   </tbody>
                 </table>
-                <div style={{marginTop:10,padding:"8px 10px",borderRadius:6,
+              </div>
+
+              <div style={{marginTop:12,display:"flex",flexDirection:"column",gap:8}}>
+                <div style={{padding:"8px 12px",borderRadius:6,
                   background:C.accentBg,border:`1px solid ${C.accentBdr}`,
                   fontSize:11,color:C.accent,lineHeight:1.7}}>
-                  {DAYS_ZH[dutyDayTab]}：{formatDutyRosterSummary(activeDutyRoster) || "请配置值班时段"}
+                  <strong>{DAYS_ZH[dutyDayTab]}</strong>：{formatDutyRosterSummary(activeDutyRoster) || "请配置值班时段"}
                 </div>
                 {dutyRosterGaps.length>0 && (
-                  <div style={{marginTop:8,padding:"8px 10px",borderRadius:6,
+                  <div style={{padding:"8px 12px",borderRadius:6,
                     background:C.warnBg,border:"1px solid #fde68a",
                     fontSize:11,color:C.warn,lineHeight:1.7}}>
                     {dutyRosterGaps.map((g,i)=>(
                       <div key={i}>
-                        · {DAYS_ZH[dutyDayTab]} {String(g.start).padStart(2,"0")}:00–{String(g.end).padStart(2,"0")}:00 无人在岗（该时段不可排产）
+                        · {String(g.start).padStart(2,"0")}:00–{String(g.end).padStart(2,"0")}:00 无人在岗（不可排产）
                       </div>
                     ))}
                   </div>
                 )}
                 {dutyRosterErrors.length>0 && (
-                  <div style={{marginTop:8,padding:"8px 10px",borderRadius:6,
+                  <div style={{padding:"8px 12px",borderRadius:6,
                     background:"#fef2f2",border:"1px solid #fecaca",
                     fontSize:11,color:C.danger,lineHeight:1.7}}>
                     {dutyRosterErrors.map((e,i)=><div key={i}>· {e}</div>)}
@@ -1952,76 +2339,77 @@ export default function App() {
               </div>
             </Card>
 
-            <Card style={{padding:16}}>
-              <SecHead icon="🕐">班次 & 计划参数</SecHead>
+            {/* 底部：配置摘要 + 约束说明 */}
+            <div style={{display:"grid",gridTemplateColumns:"minmax(260px,1fr) minmax(320px,1.4fr)",gap:12}}>
+              <Card style={{padding:14,background:C.accentBg,border:`1px solid ${C.accentBdr}`}}>
+                <SecHead color={C.accent} icon="📌" style={{margin:"0 0 10px"}}>当前有效配置</SecHead>
+                <div style={{display:"grid",gap:8,fontSize:12,color:C.accent}}>
+                  {[
+                    ["班次", `${String(cst.shiftStart).padStart(2,"0")}:00 — ${String(cst.shiftEnd).padStart(2,"0")}:00（${cst.shiftEnd - cst.shiftStart}h/天，不停线）`],
+                    ["周期", `${cst.workDays} 个工作日`],
+                    ["设备", formatEqCountSummary(normCst)],
+                    ["库存", `原料A ${cst.stockMatA} · 原料B ${cst.stockMatB} · 脱模剂 ${cst.stockRelease}`],
+                  ].map(([k,v])=>(
+                    <div key={k} style={{display:"flex",gap:8,lineHeight:1.5}}>
+                      <span style={{fontWeight:700,minWidth:36,flexShrink:0}}>{k}</span>
+                      <span style={{opacity:0.95}}>{v}</span>
+                    </div>
+                  ))}
+                </div>
+                <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${C.accentBdr}`,
+                  fontSize:11,color:C.accent,lineHeight:1.65,opacity:0.9}}>
+                  <div style={{fontWeight:700,marginBottom:4}}>值班摘要</div>
+                  {Array.from({ length: normCst.workDays }, (_, d) => (
+                    <div key={d}>{DAYS_ZH[d]}：{formatDutyRosterSummary(getDutyRosterForDay(normCst, d)) || "未配置"}</div>
+                  ))}
+                </div>
+              </Card>
 
-              {[
-                ["shiftStart",  "班次开始时间", "每天机器开始生产的小时数（24小时制）", 0, 23, 1, "时"],
-                ["shiftEnd",    "班次结束时间", "每天机器结束生产的小时数（24小时制）", 1, 24, 1, "时"],
-                ["workDays",    "排产天数",     "本次排产周期覆盖的工作日数量",      1, 14, 1, "天"],
-              ].map(([key,label,desc,min,max,step,unit])=>(
-                <div key={key} style={{marginBottom:14,padding:"11px 14px",borderRadius:8,
-                  border:`1px solid ${C.border}`,background:"#f8fafc"}}>
-                  <div style={{display:"flex",justifyContent:"space-between",
-                    alignItems:"center",marginBottom:4}}>
-                    <span style={{fontSize:13,fontWeight:600,color:C.t0}}>{label}</span>
-                    <NumInput value={cst[key]} min={min} max={max} step={step} unit={unit}
-                      onChange={v=>updCst(key,Math.max(min,v))}/>
-                  </div>
-                  <div style={{fontSize:11,color:C.t3}}>{desc}</div>
+              <Card style={{padding:14,border:`1px solid #fde68a`,background:C.warnBg}}>
+                <SecHead color={C.warn} icon="⚠️" style={{margin:"0 0 10px"}}>约束说明</SecHead>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:8,fontSize:12,color:C.t1}}>
+                  {[
+                    [C.warn,  "工序清洗", "型号配置中设置清洗时间，清洗期间设备不可用"],
+                    [C.dn,    "班次边界", "工序不跨日班次；剩余时间不足则顺延至下一工作日"],
+                    [C.accent,"值班人员", "各时段在岗人数不同，工序所需人数不得超过值班人数"],
+                    ["#8b5cf6","设备并行", "同类型多台独立排产；故障可登记到具体实例"],
+                  ].map(([color,title,desc])=>(
+                    <div key={title} style={{padding:"8px 10px",background:C.surface,borderRadius:6,
+                      borderLeft:`3px solid ${color}`}}>
+                      <strong style={{color}}>{title}</strong>
+                      <div style={{marginTop:4,color:C.t2,lineHeight:1.5,fontSize:11}}>{desc}</div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-
-              <div style={{marginTop:4,padding:"10px 14px",borderRadius:8,
-                background:C.accentBg,border:`1px solid ${C.accentBdr}`}}>
-                <SecHead color={C.accent} icon="📌" style={{margin:"0 0 6px"}}>
-                  当前有效配置
-                </SecHead>
-                <div style={{fontSize:12,color:C.accent,lineHeight:1.8}}>
-                  <div>每日生产时间：{cst.shiftEnd - cst.shiftStart} 小时（机器连续运行，不停线）</div>
-                  <div>班次：{String(cst.shiftStart).padStart(2,"0")}:00 — {String(cst.shiftEnd).padStart(2,"0")}:00</div>
-                  <div style={{whiteSpace:"pre-line"}}>值班表：{"\n"}{formatDutyWeekSummary(normCst)}</div>
-                  <div>混合后清洗：按各型号工序配置</div>
-                </div>
-              </div>
-            </Card>
-
-            <Card style={{padding:14,gridColumn:"1/-1",
-              border:`1px solid #fde68a`,background:C.warnBg}}>
-              <SecHead color={C.warn} icon="⚠️">约束说明</SecHead>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,fontSize:12,color:C.t1}}>
-                <div style={{padding:"8px 12px",background:C.surface,borderRadius:6,
-                  borderLeft:"3px solid "+C.warn}}>
-                  <strong style={{color:C.warn}}>工序清洗</strong><br/>
-                  在型号配置中设置各工序的清洗时间，清洗期间该设备不可用。
-                </div>
-                <div style={{padding:"8px 12px",background:C.surface,borderRadius:6,
-                  borderLeft:"3px solid "+C.dn}}>
-                  <strong style={{color:C.dn}}>班次边界</strong><br/>
-                  每道工序不跨班次执行。若当前班次剩余时间不足，自动顺延到下一天班次开始。
-                </div>
-                <div style={{padding:"8px 12px",background:C.surface,borderRadius:6,
-                  borderLeft:"3px solid "+C.accent}}>
-                  <strong style={{color:C.accent}}>值班表人员</strong><br/>
-                  各时段在岗人数不同；排产时工序所需人数不得超过该时段值班人数。
-                </div>
-              </div>
-            </Card>
+              </Card>
+            </div>
           </div>
         )}
 
         {/* ══════ 排产结果 ══════ */}
         {tab==="result"&&(
           <div>
-            {events.length===0?(
+            <AlgoComparePanel
+              compare={algoCompare}
+              loading={compareLoading}
+              onAdopt={adoptCompareResult}
+            />
+            {events.length===0 && !compareLoading && !algoCompare ? (
               <Card style={{padding:60,textAlign:"center"}}>
                 <div style={{fontSize:44,marginBottom:12}}>📋</div>
                 <p style={{fontSize:14,color:C.t2,marginBottom:16}}>
-                  尚未生成排产方案，请点击顶部「生成排产」按钮
+                  尚未生成排产方案，请点击「生成排产」或「算法对比」
                 </p>
-                <Btn primary onClick={generate} disabled={loading}>
-                  {loading ? "⏳ 求解中..." : "▶ 立即生成排产"}
-                </Btn>
+                <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap"}}>
+                  <Btn primary onClick={generate} disabled={loading || compareLoading}>
+                    {loading ? "⏳ 求解中..." : "▶ 立即生成排产"}
+                  </Btn>
+                  <Btn onClick={runAlgoCompare} disabled={loading || compareLoading}>⚖ 算法对比</Btn>
+                </div>
+              </Card>
+            ): events.length===0 && algoCompare ? (
+              <Card style={{padding:24,textAlign:"center",marginBottom:12}}>
+                <p style={{fontSize:13,color:C.t2,marginBottom:12}}>对比已完成，请选择上方「采用启发式」或「采用 HGNN+PPO」查看甘特图</p>
               </Card>
             ):(
               <>
@@ -2029,7 +2417,7 @@ export default function App() {
                 <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",
                   gap:10,marginBottom:12}}>
                   {[
-                    {l:"调度算法",v:algo==="greedy"?"贪心":"HGNN+PPO", c:algo==="greedy"?C.t1:"#7c3aed", s:algo==="greedy"?"默认":"智能调度"},
+                    {l:"调度算法",v:algo==="greedy"?"启发式":"HGNN+PPO", c:algo==="greedy"?C.t1:"#7c3aed", s:algo==="greedy"?"默认":"智能调度"},
                     {l:"完工时间",v:fmtTime(makespan),    c:C.danger, s:"预计"},
                     {l:"批次总数",v:batchCount+"批",       c:C.accent, s:"已排"},
                     {l:"工序总数",v:opCount+"道",           c:C.dn,     s:"含清洗"},
@@ -2066,17 +2454,17 @@ export default function App() {
                 <Card style={{padding:14,marginBottom:12}}>
                   <SecHead icon="🔧">设备利用率</SecHead>
                   <div style={{display:"flex",gap:20,flexWrap:"wrap"}}>
-                    {EQ_ORDER.filter(eq=>events.some(e=>e.eq===eq)).map(eq=>(
-                      <div key={eq} style={{flex:1,minWidth:120}}>
+                    {getEqInstances(cst).filter(inst=>events.some(e=>e.eq===inst)).map(inst=>(
+                      <div key={inst} style={{flex:1,minWidth:120}}>
                         <div style={{display:"flex",justifyContent:"space-between",
                           marginBottom:4,fontSize:11}}>
-                          <span style={{color:C.t1,fontWeight:600}}>{eq}</span>
+                          <span style={{color:C.t1,fontWeight:600}}>{inst}</span>
                           <span style={{color:C.accent,fontFamily:"monospace",fontWeight:700}}>
-                            {eqUtil[eq]||0}%
+                            {eqUtil[inst]||0}%
                           </span>
                         </div>
                         <div style={{background:C.border,borderRadius:3,height:5,overflow:"hidden"}}>
-                          <div style={{width:`${eqUtil[eq]||0}%`,height:"100%",
+                          <div style={{width:`${eqUtil[inst]||0}%`,height:"100%",
                             background:C.accent,borderRadius:3}}/>
                         </div>
                       </div>

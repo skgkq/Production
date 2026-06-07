@@ -2,7 +2,7 @@
 
 export const AGENT_FAQ = [
   { id: "faq-1", question: "如何生成排产计划？" },
-  { id: "faq-2", question: "贪心算法和 HGNN+PPO 有什么区别？" },
+  { id: "faq-2", question: "启发式算法和 HGNN+PPO 有什么区别？" },
   { id: "faq-3", question: "动态重排怎么用？会换算法吗？" },
   { id: "faq-4", question: "如何设置班次与午休约束？" },
   { id: "faq-5", question: "甘特图里黄色虚线框是什么意思？" },
@@ -20,7 +20,7 @@ const FAQ_ANSWERS = {
 5. 自动跳转到「排产结果」查看甘特图或工单表`,
 
   "faq-2": `两种算法说明：
-• **贪心算法**：前端本地计算，按优先级逐批安排工序，速度快，适合日常试排。
+• **启发式算法**：前端本地计算，按优先级逐批安排工序，速度快，适合日常试排。
 • **HGNN+PPO**：调用后端智能求解（需启动 \`python server.py\`），在柔性作业车间模型上优化设备分配与顺序，再映射到班次时间轴。
 切换算法后需重新点击「生成排产」。`,
 
@@ -29,7 +29,7 @@ const FAQ_ANSWERS = {
 2. 设置重排基准时刻（NOW 线）、可选故障窗口与新插单
 3. 已完成/进行中的工序会冻结，未开始的工序重新安排
 
-**算法一致性**：若当前选的是 HGNN+PPO，动态重排同样走后端智能重排；若为贪心，则走前端贪心重排。`,
+**算法一致性**：若当前选的是 HGNN+PPO，动态重排同样走后端智能重排；若为启发式，则走前端启发式重排。`,
 
   "faq-4": `在「约束参数」页可设置：
 • **班次**：上班开始/结束时间（如 9:00–18:00）
@@ -53,7 +53,7 @@ const FAQ_ANSWERS = {
 };
 
 const KEYWORD_RULES = [
-  { keys: ["贪心", "greedy"], reply: FAQ_ANSWERS["faq-2"] },
+  { keys: ["启发式", "贪心", "greedy"], reply: FAQ_ANSWERS["faq-2"] },
   { keys: ["hgnn", "ppo", "智能"], reply: FAQ_ANSWERS["faq-2"] },
   { keys: ["重排", "插单", "故障", "动态"], reply: FAQ_ANSWERS["faq-3"] },
   { keys: ["班次", "午休", "上班", "约束"], reply: FAQ_ANSWERS["faq-4"] },
@@ -76,7 +76,7 @@ function contextHint(context) {
   if (!context) return "";
   const parts = [];
   if (context.algo === "hgnn-ppo") parts.push("当前算法：HGNN+PPO 智能调度");
-  else if (context.algo === "greedy") parts.push("当前算法：贪心算法");
+  else if (context.algo === "greedy") parts.push("当前算法：启发式算法");
   if (context.tab) parts.push(`当前页面：${context.tab}`);
   if (context.hasEvents) parts.push("已有排产结果");
   return parts.length ? `\n\n（系统上下文：${parts.join(" · ")}）` : "";

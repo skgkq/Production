@@ -65,6 +65,7 @@ class Constraints(BaseModel):
     workDays: int = 5
     dutyRosterByDay: list[list[DutySegDef]] | None = None
     dutyRoster: list[DutySegDef] | None = None
+    eqCount: dict[str, int] | None = None
     totalWorkers: int = 4
     lunchStart: int = 12
     lunchEnd: int = 13
@@ -99,11 +100,21 @@ class EventDef(BaseModel):
     status: str = ""
 
 
+class HgnnParams(BaseModel):
+    episodes: int = 300
+    lr: float = 5e-4
+    gamma: float = 0.99
+    eps_clip: float = 0.2
+    entropy_coef: float = 0.02
+    d: int = 64
+
+
 class ScheduleRequest(BaseModel):
     plan: list[TaskDef]
     types: list[TypeDef]
     cst: Constraints
     episodes: int = 300
+    hgnn: HgnnParams | None = None
 
 
 class RescheduleRequest(BaseModel):
@@ -114,6 +125,13 @@ class RescheduleRequest(BaseModel):
     rescheduleAt: float
     failures: list[FailureDef] = []
     episodes: int = 300
+    hgnn: HgnnParams | None = None
+
+
+def resolve_hgnn_params(req) -> HgnnParams:
+    if getattr(req, "hgnn", None):
+        return req.hgnn
+    return HgnnParams(episodes=req.episodes)
 
 
 # ── 值班表 / 班次 / 设备槽位工具 ─────────────────────────────────
@@ -122,6 +140,52 @@ DUTY_NAME_POOL = [
     "小李", "小高", "小吴", "小明", "小红", "小芳", "小张", "小王", "小陈", "小刘", "小赵", "小周",
 ]
 DAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+EQ_ORDER = ["称量台", "搅拌机", "混合锅", "成型台", "整装区"]
+
+
+def default_eq_count():
+    return {eq: 1 for eq in EQ_ORDER}
+
+
+def normalize_eq_count(eq_count):
+    base = default_eq_count()
+    if not eq_count:
+        return base
+    data = eq_count if isinstance(eq_count, dict) else (
+        eq_count.model_dump() if hasattr(eq_count, "model_dump") else dict(eq_count)
+    )
+    for eq in EQ_ORDER:
+        base[eq] = max(1, min(10, int(data.get(eq, 1) or 1)))
+    return base
+
+
+def get_eq_instances(cst):
+    cst = normalize_cst(cst)
+    counts = normalize_eq_count(cst.get("eqCount"))
+    result = []
+    for eq in EQ_ORDER:
+        n = counts[eq]
+        if n <= 1:
+            result.append(eq)
+        else:
+            for i in range(1, n + 1):
+                result.append(f"{eq}{i}")
+    return result
+
+
+def eq_type_of(instance):
+    if instance in EQ_ORDER:
+        return instance
+    for eq in EQ_ORDER:
+        if instance.startswith(eq):
+            suffix = instance[len(eq):]
+            if suffix.isdigit():
+                return eq
+    return instance
+
+
+def instances_for_type(cst, eq_type):
+    return [inst for inst in get_eq_instances(cst) if eq_type_of(inst) == eq_type]
 
 
 def make_default_duty_day():
@@ -184,8 +248,10 @@ def normalize_cst(cst):
         "shiftEnd": 18,
         "workDays": 5,
         "dutyRosterByDay": [make_default_duty_day() for _ in range(5)],
+        "eqCount": default_eq_count(),
         **data,
     }
+    base["eqCount"] = normalize_eq_count(base.get("eqCount"))
     if base.get("dutyRosterByDay"):
         week = [[normalize_duty_seg(seg) for seg in day] for day in base["dutyRosterByDay"]]
         while len(week) < 5:
@@ -373,7 +439,7 @@ def make_slot_finder(cst, eq_timelines, worker_tl, failures=None):
                 t = next_work_start(fail_end)
                 continue
             clash = False
-            for blk in eq_timelines[eq]:
+            for blk in eq_timelines.get(eq, []):
                 if blk[0] < t + dur and blk[1] > t:
                     t = next_work_start(blk[1])
                     clash = True
@@ -405,16 +471,12 @@ def expand_batches(plan, type_map):
     return batches
 
 
-def build_eq_index(types):
-    eq_set = set()
-    for pt in types:
-        for op in pt.ops:
-            eq_set.add(op.eq)
-    eq_list = sorted(eq_set)
+def build_eq_index(types, cst):
+    eq_list = get_eq_instances(cst)
     return eq_list, {eq: i for i, eq in enumerate(eq_list)}
 
 
-def build_proc_jobs(batches, eq_to_idx, start_op_indices):
+def build_proc_jobs(batches, eq_to_idx, start_op_indices, cst):
     """start_op_indices: 与 batches 等长的每批次起始工序下标"""
     proc = []
     batch_meta = []
@@ -425,10 +487,18 @@ def build_proc_jobs(batches, eq_to_idx, start_op_indices):
         meta_ops = []
         for op_idx in range(start_op, len(pt.ops)):
             op = pt.ops[op_idx]
-            m_idx = eq_to_idx[op.eq]
+            eq_type = op.eq
             total_dur = op.dur + (op.cleanDur or 0) + (op.agv or 0)
-            job_ops.append({m_idx: total_dur})
-            meta_ops.append({"op": op, "orig_op_idx": op_idx})
+            machine_map = {}
+            for inst in instances_for_type(cst, eq_type):
+                if inst in eq_to_idx:
+                    machine_map[eq_to_idx[inst]] = total_dur
+            if not machine_map:
+                m_idx = eq_to_idx.get(eq_type)
+                if m_idx is not None:
+                    machine_map[m_idx] = total_dur
+            job_ops.append(machine_map)
+            meta_ops.append({"op": op, "orig_op_idx": op_idx, "eq_type": eq_type})
         proc.append(job_ops)
         batch_meta.append({"batch": batch, "ops": meta_ops})
     return proc, batch_meta
@@ -490,6 +560,8 @@ def map_hgnn_to_events(schedule, proc, batch_meta, idx_to_eq, cst, eq_timelines,
         start = find_slot(eq, min_start, dur, op.workers)
         end = start + dur
 
+        if eq not in eq_timelines:
+            eq_timelines[eq] = []
         eq_timelines[eq].append((start, end))
         eq_timelines[eq].sort()
         job_end_times[j] = end
@@ -548,16 +620,20 @@ def merge_reschedule_events(frozen_marked, new_events):
     return merged
 
 
-def run_hgnn_schedule(plan, types, cst, episodes, failures=None, frozen_marked=None,
+def run_hgnn_schedule(plan, types, cst, hgnn_params: HgnnParams | None = None, episodes=300,
+                      failures=None, frozen_marked=None,
                       batch_progress=None, reschedule_at=0.0):
+    hp = hgnn_params or HgnnParams(episodes=episodes)
     type_map = {t.id: t for t in types}
     batches = expand_batches(plan, type_map)
     if not batches:
         return {"events": [], "makespan": 0}
 
-    eq_list, eq_to_idx = build_eq_index(types)
+    eq_list, eq_to_idx = build_eq_index(types, cst)
     n_machines = len(eq_list)
     idx_to_eq = {i: eq for eq, i in eq_to_idx.items()}
+
+    cst_norm = normalize_cst(cst)
 
     start_op_indices = []
     active_job_indices = []
@@ -578,7 +654,7 @@ def run_hgnn_schedule(plan, types, cst, episodes, failures=None, frozen_marked=N
     active_batches = [batches[i] for i in active_job_indices]
     active_start_ops = [start_op_indices[i] for i in active_job_indices]
 
-    proc_all, batch_meta_all = build_proc_jobs(active_batches, eq_to_idx, active_start_ops)
+    proc_all, batch_meta_all = build_proc_jobs(active_batches, eq_to_idx, active_start_ops, cst_norm)
     proc, batch_meta = [], []
     for job, meta in zip(proc_all, batch_meta_all):
         if job:
@@ -592,13 +668,24 @@ def run_hgnn_schedule(plan, types, cst, episodes, failures=None, frozen_marked=N
             "makespan": max((e["end"] for e in events), default=0),
         }
 
-    schedule, _ = solve_fjsp(proc, n_machines, n_episodes=episodes)
+    schedule, best_ms = solve_fjsp(
+        proc, n_machines,
+        n_episodes=hp.episodes,
+        lr=hp.lr,
+        gamma=hp.gamma,
+        eps_clip=hp.eps_clip,
+        entropy_coef=hp.entropy_coef,
+        d=hp.d,
+    )
     if schedule is None:
         return {"events": [], "makespan": 0, "error": "求解失败"}
 
     eq_timelines = {eq: [] for eq in eq_list}
     for e in frozen_marked or []:
-        eq_timelines[e["eq"]].append((e["start"], e["end"]))
+        inst = e["eq"]
+        if inst not in eq_timelines:
+            eq_timelines[inst] = []
+        eq_timelines[inst].append((e["start"], e["end"]))
     for eq in eq_list:
         eq_timelines[eq].sort()
 
@@ -632,14 +719,17 @@ def run_hgnn_schedule(plan, types, cst, episodes, failures=None, frozen_marked=N
 
 @app.post("/api/schedule/hgnn-ppo")
 def schedule_hgnn_ppo(req: ScheduleRequest):
-    result = run_hgnn_schedule(req.plan, req.types, req.cst, req.episodes)
+    hp = resolve_hgnn_params(req)
+    result = run_hgnn_schedule(req.plan, req.types, req.cst, hgnn_params=hp)
     if result.get("error"):
         return result
+    result["hgnnParams"] = hp.model_dump()
     return result
 
 
 @app.post("/api/schedule/hgnn-ppo/reschedule")
 def schedule_hgnn_reschedule(req: RescheduleRequest):
+    hp = resolve_hgnn_params(req)
     failures = req.failures
     current_events = [
         e.model_dump() if hasattr(e, "model_dump") else dict(e)
@@ -652,7 +742,7 @@ def schedule_hgnn_reschedule(req: RescheduleRequest):
     plan_with_wo = assign_stable_wo_for_reschedule(req.plan, current_events)
 
     result = run_hgnn_schedule(
-        plan_with_wo, req.types, req.cst, req.episodes,
+        plan_with_wo, req.types, req.cst, hgnn_params=hp,
         failures=failures,
         frozen_marked=frozen_marked,
         batch_progress=batch_progress,
