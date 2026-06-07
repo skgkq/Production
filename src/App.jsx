@@ -1,5 +1,4 @@
 import { useState, useMemo, useEffect } from "react";
-import { apiUrl } from "./apiBase";
 // import { AgentWidget } from "./components/agent";  // 智能客服：汇报前暂不展示，取消注释即可启用
 
 // ══════════════════════════════════════════════════════════════════
@@ -1454,7 +1453,7 @@ export default function App() {
   };
 
   const fetchHgnnSchedule = async (body) => {
-    const resp = await fetch(apiUrl("/api/schedule/hgnn-ppo"), {
+    const resp = await fetch("/api/schedule/hgnn-ppo", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -1559,7 +1558,7 @@ export default function App() {
     if (algo === "hgnn-ppo") {
       setLoading(true);
       try {
-        const resp = await fetch(apiUrl("/api/schedule/hgnn-ppo/reschedule"), {
+        const resp = await fetch("/api/schedule/hgnn-ppo/reschedule", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
