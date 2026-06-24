@@ -1,3 +1,4 @@
+import { normalizeWorkersFields } from "./workersRange.js";
 import { normalizeOps, topologicalSort } from "./dag.js";
 import { initRoomTimelines } from "./rooms.js";
 import { findBestRoomSlot, normalizeCst } from "./shift.js";
@@ -73,6 +74,8 @@ export function runSchedule(plan, ops, cst, opts = {}) {
         const end = start + op.dur;
         const wo = `WO-${String(batch.wo).padStart(3, "0")}`;
 
+        const wr = normalizeWorkersFields(op);
+
         events.push({
           wo,
           batchNum: batch.batchNum,
@@ -86,7 +89,10 @@ export function runSchedule(plan, ops, cst, opts = {}) {
           start,
           end,
           dur: op.dur,
-          workers: op.workers || 1,
+          workersMin: wr.workersMin,
+          workersMax: wr.workersMax,
+          workers: wr.workersMax,
+          requiredLevel: op.requiredLevel ?? 3,
           color: OP_COLORS[op.id] || "#64748b",
           note: batch.task.note || "",
         });
@@ -94,7 +100,7 @@ export function runSchedule(plan, ops, cst, opts = {}) {
         if (!roomTls[room]) roomTls[room] = [];
         roomTls[room].push({ start, end });
         roomTls[room].sort((a, b) => a.start - b.start);
-        if (op.workers > 0) workerTl.push({ start, end, workers: op.workers });
+        if (wr.workersMax > 0) workerTl.push({ start, end, workers: wr.workersMax });
 
         opEnds[op.id] = end;
         doneOpIds.add(op.id);

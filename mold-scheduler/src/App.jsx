@@ -1,11 +1,12 @@
 import { useState, useMemo } from "react";
 import {
-  Layout, Menu, Button, Alert, Card, Form, InputNumber, Tag, Space,
+  Layout, Tabs, Button, Alert, Card, Form, InputNumber, Tag, Space,
   Statistic, Row, Col, Segmented, Switch, Empty, Typography, Divider,
 } from "antd";
 import {
   ApartmentOutlined, SettingOutlined, ScheduleOutlined, BarChartOutlined,
   PlayCircleOutlined, HomeOutlined, TableOutlined, FundProjectionScreenOutlined,
+  TeamOutlined,
 } from "@ant-design/icons";
 import {
   DEFAULT_OPS, DEFAULT_PLAN, DEFAULT_CST, DEFAULT_ROOM_MATRIX, DEFAULT_ROOM_LIST,
@@ -20,19 +21,28 @@ import OpConfigTable from "./components/OpConfigTable.jsx";
 import PlanPanel from "./components/PlanPanel.jsx";
 import GanttByRoom from "./components/GanttByRoom.jsx";
 import WorkOrderTable from "./components/WorkOrderTable.jsx";
+import StaffScheduleTable from "./components/StaffScheduleTable.jsx";
+import StaffListPanel from "./components/StaffListPanel.jsx";
+import { assignStaffToEvents } from "./scheduler/staffAssign.js";
 
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
 
-const MENU_ITEMS = [
-  { key: "ops", icon: <ApartmentOutlined />, label: "工步配置" },
-  { key: "cst", icon: <SettingOutlined />, label: "约束参数" },
-  { key: "plan", icon: <ScheduleOutlined />, label: "排产计划" },
-  { key: "result", icon: <BarChartOutlined />, label: "排产结果" },
+const PAGE_SHELL = { maxWidth: 1440, margin: "0 auto", width: "100%" };
+
+const TAB_ITEMS = [
+  { key: "ops", label: <><ApartmentOutlined /> 工步配置</> },
+  { key: "cst", label: <><SettingOutlined /> 约束参数</> },
+  { key: "plan", label: <><ScheduleOutlined /> 排产计划</> },
+  { key: "result", label: <><BarChartOutlined /> 排产结果</> },
 ];
 
 function cloneOps(ops) {
-  return ops.map(o => ({ ...o, deps: [...(o.deps || [])], rooms: [...(o.rooms || [])] }));
+  return ops.map(o => ({
+    ...o,
+    deps: [...(o.deps || [])],
+    rooms: [...(o.rooms || [])],
+  }));
 }
 
 export default function App() {
@@ -41,6 +51,9 @@ export default function App() {
   const [plan, setPlan] = useState(() => [...DEFAULT_PLAN]);
   const [cst, setCst] = useState(() => ({ ...DEFAULT_CST }));
   const [events, setEvents] = useState([]);
+  const [staffRows, setStaffRows] = useState([]);
+  const [staffSummary, setStaffSummary] = useState({});
+  const [assignShortageCount, setAssignShortageCount] = useState(0);
   const [collapseGroup, setCollapseGroup] = useState(false);
   const [view, setView] = useState("gantt");
   const [roomMatrixText, setRoomMatrixText] = useState(() =>
@@ -79,15 +92,27 @@ export default function App() {
       setScheduling(false);
       return;
     }
-    setEvents(evts);
+    const { events: withStaff, staffRows: rows, staffSummary: summary, shortageCount } =
+      assignStaffToEvents(evts, normCst.staffList);
+    setEvents(withStaff);
+    setStaffRows(rows);
+    setStaffSummary(summary);
+    setAssignShortageCount(shortageCount);
     setError("");
     setTab("result");
     setScheduling(false);
   };
 
+  const resetResults = () => {
+    setEvents([]);
+    setStaffRows([]);
+    setStaffSummary({});
+    setAssignShortageCount(0);
+  };
+
   const updCst = (k, v) => {
     setCst(p => normalizeCst({ ...p, [k]: v }));
-    setEvents([]);
+    resetResults();
   };
 
   const addRoom = () => {
@@ -102,41 +127,43 @@ export default function App() {
   };
 
   return (
-    <Layout style={{ minHeight: "100vh" }}>
-      <Header style={{ display: "flex", alignItems: "center", padding: "0 24px" }}>
-        <div style={{ display: "flex", alignItems: "center", flex: 1, minWidth: 0 }}>
-          <FundProjectionScreenOutlined style={{ fontSize: 22, color: "#fff", marginRight: 12 }} />
-          <div>
-            <Title level={5} style={{ color: "#fff", margin: 0, lineHeight: 1.3 }}>
-              模具工步排产系统
-            </Title>
-            <Text style={{ color: "rgba(255,255,255,0.65)", fontSize: 12 }}>
-              DAG 拓扑调度 · 房间资源约束
-            </Text>
+    <Layout style={{ minHeight: "100vh", background: "#f0f2f5" }}>
+      <Header style={{ padding: "0 24px", height: 56, lineHeight: "56px" }}>
+        <div style={{ ...PAGE_SHELL, display: "flex", alignItems: "center", gap: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", flex: 1, minWidth: 0 }}>
+            <FundProjectionScreenOutlined style={{ fontSize: 22, color: "#fff", marginRight: 12 }} />
+            <div>
+              <Title level={5} style={{ color: "#fff", margin: 0, lineHeight: 1.3 }}>
+                模具工步排产系统
+              </Title>
+              <Text style={{ color: "rgba(255,255,255,0.65)", fontSize: 12 }}>
+                DAG 拓扑调度 · 房间资源约束
+              </Text>
+            </div>
           </div>
+          <Button
+            type="primary"
+            icon={<PlayCircleOutlined />}
+            loading={scheduling}
+            onClick={handleSchedule}
+          >
+            生成排产
+          </Button>
         </div>
-        <Button
-          type="primary"
-          icon={<PlayCircleOutlined />}
-          loading={scheduling}
-          onClick={handleSchedule}
-          style={{ background: "#1677ff" }}
-        >
-          生成排产
-        </Button>
       </Header>
 
       <div style={{ background: "#fff", borderBottom: "1px solid #f0f0f0", padding: "0 24px" }}>
-        <Menu
-          mode="horizontal"
-          selectedKeys={[tab]}
-          items={MENU_ITEMS}
-          onClick={({ key }) => setTab(key)}
-          style={{ border: "none", minWidth: 0, flex: "auto" }}
-        />
+        <div style={PAGE_SHELL}>
+          <Tabs
+            activeKey={tab}
+            onChange={setTab}
+            items={TAB_ITEMS}
+            style={{ marginBottom: 0 }}
+          />
+        </div>
       </div>
 
-      <Content style={{ padding: 24, maxWidth: 1440, margin: "0 auto", width: "100%" }}>
+      <Content style={{ ...PAGE_SHELL, padding: "16px 24px 24px", flex: 1 }}>
         {error && (
           <Alert
             type="error"
@@ -154,7 +181,7 @@ export default function App() {
             ops={ops}
             roomList={normCst.roomList}
             roomMatrixText={roomMatrixText}
-            onOpsChange={v => { setOps(v); setEvents([]); }}
+            onOpsChange={v => { setOps(v); resetResults(); }}
             onMatrixTextChange={setRoomMatrixText}
             onApplyMatrix={applyMatrix}
           />
@@ -163,14 +190,14 @@ export default function App() {
         {tab === "cst" && (
           <Row gutter={[16, 16]}>
             <Col xs={24} lg={12}>
-              <Card size="small" title={<><SettingOutlined /> 班次与人员</>}>
+              <Card size="small" title={<><SettingOutlined /> 班次参数</>}>
                 <Form layout="vertical" size="small">
                   <Row gutter={16}>
                     {[
                       ["shiftStart", "班次开始 (时)", 0, 23],
                       ["shiftEnd", "班次结束 (时)", 1, 24],
                       ["workDays", "排产天数", 1, 14],
-                      ["totalWorkers", "可用人数", 1, 20],
+                      ["totalWorkers", "同时在岗人数上限", 1, 20],
                     ].map(([k, label, min, max]) => (
                       <Col span={12} key={k}>
                         <Form.Item label={label}>
@@ -189,6 +216,12 @@ export default function App() {
               </Card>
             </Col>
             <Col xs={24} lg={12}>
+              <StaffListPanel
+                staffList={cst.staffList || normCst.staffList}
+                onChange={v => updCst("staffList", v)}
+              />
+            </Col>
+            <Col xs={24}>
               <Card
                 size="small"
                 title={<><HomeOutlined /> 生产房间</>}
@@ -221,11 +254,27 @@ export default function App() {
         )}
 
         {tab === "plan" && (
-          <PlanPanel plan={plan} onChange={v => { setPlan(v); setEvents([]); }} />
+          <PlanPanel plan={plan} onChange={v => { setPlan(v); resetResults(); }} />
         )}
 
         {tab === "result" && (
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+            {events.length === 0 && (
+              <Card size="small">
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description="暂无排产数据，请配置工步后点击右上角「生成排产」"
+                />
+              </Card>
+            )}
+            {assignShortageCount > 0 && (
+              <Alert
+                type="warning"
+                showIcon
+                message={`${assignShortageCount} 道工步派工不足`}
+                description="等级达标且空闲的人员不够，未对低等级人员降级派工。请调整人员等级或工步要求等级后重新排产。"
+              />
+            )}
             {stats && (
               <Card size="small" bodyStyle={{ padding: "12px 16px" }}>
                 <Row gutter={[16, 16]}>
@@ -251,11 +300,12 @@ export default function App() {
               </Card>
             )}
 
+            {events.length > 0 && (
             <Card
               size="small"
               title="排产结果"
               extra={
-                <Space>
+                <Space wrap>
                   <Segmented
                     size="small"
                     value={view}
@@ -263,6 +313,7 @@ export default function App() {
                     options={[
                       { label: "甘特图", value: "gantt", icon: <BarChartOutlined /> },
                       { label: "工单", value: "workorder", icon: <TableOutlined /> },
+                      { label: "人员排班", value: "staff", icon: <TeamOutlined /> },
                     ]}
                   />
                   <Switch
@@ -276,17 +327,15 @@ export default function App() {
                 </Space>
               }
             >
-              {events.length === 0 ? (
-                <Empty
-                  image={Empty.PRESENTED_IMAGE_SIMPLE}
-                  description="暂无排产数据，请配置工步后点击「生成排产」"
-                />
-              ) : view === "gantt" ? (
+              {view === "gantt" ? (
                 <GanttByRoom events={events} cst={normCst} collapseGroup={collapseGroup} />
+              ) : view === "staff" ? (
+                <StaffScheduleTable staffRows={staffRows} staffSummary={staffSummary} />
               ) : (
                 <WorkOrderTable events={events} collapseGroup={collapseGroup} />
               )}
             </Card>
+            )}
           </Space>
         )}
       </Content>

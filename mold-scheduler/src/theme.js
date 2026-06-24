@@ -22,6 +22,10 @@ export const industrialTheme = {
       itemHeight: 40,
       horizontalItemSelectedColor: "#0958d9",
     },
+    Tabs: {
+      margin: 0,
+      horizontalMargin: "0",
+    },
     Table: {
       headerBg: "#fafafa",
       cellPaddingBlock: 8,

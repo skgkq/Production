@@ -2,7 +2,29 @@
  * 班次与人员约束（从原系统精简复制）
  */
 
+import { DEFAULT_STAFF_LIST } from "../data/opsSeed.js";
+import { normalizeWorkersFields } from "./workersRange.js";
+
 const DAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+
+function clampLevel(level) {
+  return Math.max(2, Math.min(5, Math.floor(Number(level) || 3)));
+}
+
+function normalizeStaffList(cst) {
+  if (Array.isArray(cst.staffList) && cst.staffList.length) {
+    return cst.staffList
+      .map(s => ({
+        name: String(s.name || "").trim(),
+        level: clampLevel(s.level),
+      }))
+      .filter(s => s.name);
+  }
+  if (Array.isArray(cst.staffNames) && cst.staffNames.length) {
+    return cst.staffNames.map(name => ({ name: String(name).trim(), level: 3 })).filter(s => s.name);
+  }
+  return DEFAULT_STAFF_LIST.map(s => ({ ...s }));
+}
 
 export function normalizeCst(cst) {
   const base = {
@@ -10,11 +32,13 @@ export function normalizeCst(cst) {
     shiftEnd: 18,
     workDays: 5,
     roomList: [1, 2, 3, 4, 5, 6, 7, 8],
-    totalWorkers: 4,
+    totalWorkers: 7,
     ...cst,
   };
   base.roomList = [...(base.roomList || [])].map(Number).filter(n => n > 0);
   if (!base.roomList.length) base.roomList = [1];
+  base.staffList = normalizeStaffList(base);
+  base.staffNames = base.staffList.map(s => s.name);
   return base;
 }
 
@@ -143,12 +167,13 @@ export function findRoomSlot(room, tl, minStart, dur, cst, workerTl, workers) {
 
 export function findBestRoomSlot(op, roomTls, minStart, cst, workerTl) {
   const rooms = op.rooms || [];
+  const { workersMax } = normalizeWorkersFields(op);
   let bestStart = Infinity;
   let bestRoom = rooms[0];
 
   for (const room of rooms) {
     const tl = roomTls[room] || [];
-    const start = findRoomSlot(room, tl, minStart, op.dur, cst, workerTl, op.workers || 1);
+    const start = findRoomSlot(room, tl, minStart, op.dur, cst, workerTl, workersMax);
     if (start < bestStart) {
       bestStart = start;
       bestRoom = room;

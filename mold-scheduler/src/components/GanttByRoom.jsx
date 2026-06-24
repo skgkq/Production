@@ -8,6 +8,25 @@ function formatTime(t) {
   return `${DAYS_ZH[day] || `D${day + 1}`} ${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
+function truncId(text, barWidth, charPx = 5) {
+  const maxChars = Math.max(1, Math.floor((barWidth - 4) / charPx));
+  if (!text || text.length <= maxChars) return text || "";
+  return `${text.slice(0, Math.max(1, maxChars - 1))}…`;
+}
+
+function barLabel(evt, bw) {
+  const opId = evt.opId || "";
+  if (!opId) return null;
+
+  if (bw >= 28) {
+    return { text: opId, fontSize: 10, fontWeight: 700, inside: true };
+  }
+  if (bw >= 14) {
+    return { text: opId, fontSize: 8, fontWeight: 700, inside: true };
+  }
+  return { text: truncId(opId, Math.max(bw, 12), 4.5), fontSize: 8, fontWeight: 600, inside: false };
+}
+
 export default function GanttByRoom({ events, cst, collapseGroup }) {
   if (!events.length) return null;
 
@@ -33,7 +52,7 @@ export default function GanttByRoom({ events, cst, collapseGroup }) {
     for (const e of events) {
       const key = `${e.room}|${e.opGroup || e.opName}|${e.batchLabel}`;
       if (!grouped[key]) {
-        grouped[key] = { ...e, start: e.start, end: e.end, opName: e.opGroup || e.opName };
+        grouped[key] = { ...e, start: e.start, end: e.end };
       } else {
         grouped[key].start = Math.min(grouped[key].start, e.start);
         grouped[key].end = Math.max(grouped[key].end, e.end);
@@ -105,30 +124,41 @@ export default function GanttByRoom({ events, cst, collapseGroup }) {
                   const x1 = LBL + toX(evt.start) * PX;
                   const x2 = LBL + toX(evt.end) * PX;
                   const bw = Math.max(x2 - x1 - 2, 2);
-                  const label = evt.opGroup && !collapseGroup
-                    ? `${evt.opGroup}·${evt.opName}`
-                    : evt.opName;
+                  const labelInfo = barLabel(evt, bw);
+                  const title = [evt.opName, evt.opId, evt.batchLabel].filter(Boolean).join(" · ");
+                  const cx = x1 + 1 + bw / 2;
+                  const cy = y + ROW / 2 + 4;
                   return (
                     <g key={ei}>
                       <rect
                         x={x1 + 1} y={y + 4} width={bw} height={ROW - 8}
                         fill={evt.color} opacity={0.92} rx={2}
                         stroke="#fff" strokeWidth={0.5}
-                      />
-                      {bw > 28 && (
+                      >
+                        <title>{title}</title>
+                      </rect>
+                      {labelInfo?.inside && labelInfo.text && (
                         <text
-                          x={x1 + bw / 2 + 1} y={y + ROW / 2 + 1} textAnchor="middle"
-                          fontSize={9} fontWeight={600} fontFamily="sans-serif" fill="#fff"
+                          x={cx} y={cy} textAnchor="middle"
+                          fontSize={labelInfo.fontSize}
+                          fontWeight={labelInfo.fontWeight}
+                          fontFamily="monospace"
+                          fill="#fff"
+                          pointerEvents="none"
                         >
-                          {label}
+                          {labelInfo.text}
                         </text>
                       )}
-                      {bw > 52 && (
+                      {labelInfo && !labelInfo.inside && labelInfo.text && (
                         <text
-                          x={x1 + bw / 2 + 1} y={y + ROW / 2 + 11} textAnchor="middle"
-                          fontSize={8} fontFamily="sans-serif" fill="rgba(255,255,255,0.9)"
+                          x={x1 + bw + 4} y={cy} textAnchor="start"
+                          fontSize={labelInfo.fontSize}
+                          fontWeight={labelInfo.fontWeight}
+                          fontFamily="monospace"
+                          fill="#595959"
+                          pointerEvents="none"
                         >
-                          {evt.batchLabel}
+                          {labelInfo.text}
                         </text>
                       )}
                     </g>

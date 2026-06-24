@@ -2,6 +2,8 @@
  * DAG 工具：工序 deps 规范化、拓扑排序、环检测
  */
 
+import { normalizeWorkersFields } from "./workersRange.js";
+
 export function resolveOpDeps(op, ops, index) {
   if (Array.isArray(op.deps) && op.deps.length > 0) return [...op.deps];
   if (index > 0) return [ops[index - 1].id];
@@ -20,6 +22,7 @@ export function normalizeOps(ops) {
 
   const normalized = ops.map((op, i) => ({
     ...op,
+    ...normalizeWorkersFields(op),
     deps: resolveOpDeps(op, ops, i),
   }));
 

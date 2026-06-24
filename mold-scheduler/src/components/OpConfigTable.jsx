@@ -4,6 +4,7 @@ import {
   Space, Typography, Tag,
 } from "antd";
 import { ApartmentOutlined, TableOutlined } from "@ant-design/icons";
+import { normalizeWorkersFields } from "../scheduler/workersRange.js";
 
 const { Text, Paragraph } = Typography;
 
@@ -14,6 +15,18 @@ export default function OpConfigTable({
 
   const updOp = (id, patch) => {
     onOpsChange(ops.map(o => (o.id === id ? { ...o, ...patch } : o)));
+  };
+
+  const updWorkers = (id, patch) => {
+    const row = ops.find(o => o.id === id);
+    if (!row) return;
+    const merged = normalizeWorkersFields({ ...row, ...patch });
+    updOp(id, {
+      ...patch,
+      workersMin: merged.workersMin,
+      workersMax: merged.workersMax,
+      workers: merged.workersMax,
+    });
   };
 
   const depOptions = ops.map(o => ({ label: `${o.id} ${o.name}`, value: o.id }));
@@ -91,19 +104,54 @@ export default function OpConfigTable({
       ),
     },
     {
-      title: "人员",
-      dataIndex: "workers",
-      width: 72,
-      render: (workers, row) => (
-        <InputNumber
+      title: "要求等级",
+      dataIndex: "requiredLevel",
+      width: 88,
+      render: (lv, row) => (
+        <Select
           size="small"
-          min={1}
-          max={20}
-          value={workers}
-          onChange={v => updOp(row.id, { workers: v ?? 1 })}
           style={{ width: "100%" }}
+          value={lv ?? 3}
+          options={[2, 3, 4, 5].map(v => ({ label: `L${v}`, value: v }))}
+          onChange={v => updOp(row.id, { requiredLevel: v })}
         />
       ),
+    },
+    {
+      title: "人数下限",
+      dataIndex: "workersMin",
+      width: 80,
+      render: (_, row) => {
+        const { workersMin } = normalizeWorkersFields(row);
+        return (
+          <InputNumber
+            size="small"
+            min={1}
+            max={20}
+            value={workersMin}
+            onChange={v => updWorkers(row.id, { workersMin: v ?? 1 })}
+            style={{ width: "100%" }}
+          />
+        );
+      },
+    },
+    {
+      title: "人数上限",
+      dataIndex: "workersMax",
+      width: 80,
+      render: (_, row) => {
+        const { workersMax } = normalizeWorkersFields(row);
+        return (
+          <InputNumber
+            size="small"
+            min={1}
+            max={20}
+            value={workersMax}
+            onChange={v => updWorkers(row.id, { workersMax: v ?? 1 })}
+            style={{ width: "100%" }}
+          />
+        );
+      },
     },
     {
       title: "分组",
@@ -141,7 +189,7 @@ export default function OpConfigTable({
         }
       >
         <Paragraph type="secondary" style={{ marginBottom: 12, fontSize: 12 }}>
-          配置 DAG 前置依赖与房间可执行资格。矩阵中 1 表示可在该房间执行，0 表示不可。
+          配置 DAG 前置依赖与房间可执行资格。人数区间：排产按上限占产能，派工在 min~max 间按空闲人员分配；固定人数时 min=max。
         </Paragraph>
 
         {matrixOpen && (
@@ -176,7 +224,7 @@ export default function OpConfigTable({
           size="small"
           bordered
           pagination={false}
-          scroll={{ x: 1200 }}
+          scroll={{ x: 1400 }}
           dataSource={ops}
           columns={columns}
         />
